@@ -8,14 +8,25 @@ from datetime import datetime, timedelta, timezone
 # =========================
 # CONFIG
 # =========================
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+
+print("TOKEN prefix:", TOKEN[:4], "len:", len(TOKEN))
+
 if not TOKEN:
-    raise ValueError("BOT_TOKEN is not set. Add it in Railway/Render Variables.")
+    raise ValueError("BOT_TOKEN is not set. Add it in Railway Variables.")
+
 
 bot = telebot.TeleBot(TOKEN)
+try:
+    me = bot.get_me()
+    print("BOT OK:", me.username)
+except Exception as e:
+    print("BOT AUTH ERROR:", e)
+    raise
+
 
 UNLIMITED_MODE = False                 # True = убрать лимит всем (не надо)
-ADMIN_IDS = {8565307134}               # твой chat_id (только у тебя без лимита)
+ADMIN_IDS = {8311003582}               # твой chat_id (только у тебя без лимита)
 
 KZ_TZ = timezone(timedelta(hours=5))
 
