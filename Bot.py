@@ -9,23 +9,12 @@ from datetime import datetime, timedelta, timezone
 # CONFIG
 # =========================
 TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-
-print("TOKEN prefix:", TOKEN[:4], "len:", len(TOKEN))
-
 if not TOKEN:
     raise ValueError("BOT_TOKEN is not set. Add it in Railway Variables.")
 
-
 bot = telebot.TeleBot(TOKEN)
-try:
-    me = bot.get_me()
-    print("BOT OK:", me.username)
-except Exception as e:
-    print("BOT AUTH ERROR:", e)
-    raise
 
-
-UNLIMITED_MODE = False                 # True = убрать лимит всем (не надо)
+UNLIMITED_MODE = False                 # True = убрать лимит всем
 ADMIN_IDS = {8311003582}               # твой chat_id (только у тебя без лимита)
 
 KZ_TZ = timezone(timedelta(hours=5))
@@ -45,6 +34,7 @@ def db_init():
             chat_id INTEGER NOT NULL,
             event_type TEXT NOT NULL,
             action TEXT,
+            action_type TEXT,
             created_at TEXT NOT NULL
         )
         """)
@@ -58,12 +48,12 @@ def db_init():
         """)
         conn.commit()
 
-def db_add_event(chat_id, event_type, action=None):
+def db_add_event(chat_id, event_type, action=None, action_type=None):
     now = datetime.now(KZ_TZ).isoformat()
     with db_lock, sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO events(chat_id,event_type,action,created_at) VALUES(?,?,?,?)",
-            (chat_id, event_type, action, now)
+            "INSERT INTO events(chat_id,event_type,action,action_type,created_at) VALUES(?,?,?,?,?)",
+            (chat_id, event_type, action, action_type, now)
         )
         conn.commit()
 
@@ -97,7 +87,7 @@ def can_start_today(chat_id):
 # SESSION MEMORY
 # =========================
 user_data = {}   # chat_id -> dict
-timers = {}      # chat_id -> dict of timers
+timers = {}      # chat_id -> {"reminder": Timer, "coach": Timer}
 
 CRITERIA = [
     ("influence", "Влияние (польза для результата)"),
@@ -115,9 +105,9 @@ HINTS = {
 
 def reset_session(chat_id):
     user_data[chat_id] = {
-        "step": "energy",      # energy -> actions -> scoring -> result
-        "energy_now": None,    # high/mid/low
-        "actions": [],         # [{"name": str, "scores": {}}]
+        "step": "energy",        # energy -> actions -> typing -> scoring -> result
+        "energy_now": None,      # high/mid/low
+        "actions": [],           # [{"name": str, "type": str, "scores": {}}]
         "cur_action": 0,
         "cur_crit": 0,
         "focus": None
@@ -151,6 +141,18 @@ def energy_kb():
     )
     return kb
 
+def action_type_kb():
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("🧠 Умственное", callback_data="atype:mental"),
+        types.InlineKeyboardButton("💪 Физическое", callback_data="atype:physical"),
+    )
+    kb.row(
+        types.InlineKeyboardButton("🗂 Рутинное", callback_data="atype:routine"),
+        types.InlineKeyboardButton("💬 Общение", callback_data="atype:social"),
+    )
+    return kb
+
 def score_kb():
     kb = types.InlineKeyboardMarkup(row_width=5)
     kb.add(*[
@@ -176,6 +178,14 @@ def coach_kb():
         types.InlineKeyboardButton("❌ Бросил", callback_data="coach:quit"),
     )
     return kb
+
+def type_label(t: str) -> str:
+    return {
+        "mental": "🧠 Умственное",
+        "physical": "💪 Физическое",
+        "routine": "🗂 Рутинное",
+        "social": "💬 Общение",
+    }.get(t, "—")
 
 # =========================
 # COMMANDS
@@ -209,7 +219,8 @@ def help_cmd(message):
         "1) /start или 🚀 Начать\n"
         "2) Выбери энергию\n"
         "3) Напиши 3–7 действий\n"
-        "4) Оцени каждое действие по 4 критериям (1–5)\n\n"
+        "4) Для каждого выбери тип\n"
+        "5) Оцени по 4 критериям (1–5)\n\n"
         "⛔ 1 выбор в день (кроме админа).",
         reply_markup=menu_kb()
     )
@@ -257,13 +268,49 @@ def get_actions(message):
         bot.send_message(chat_id, "Нужно 3–7 действий. Каждое с новой строки.")
         return
 
-    user_data[chat_id]["actions"] = [{"name": a, "scores": {}} for a in lines]
+    user_data[chat_id]["actions"] = [{"name": a, "type": None, "scores": {}} for a in lines]
     user_data[chat_id]["cur_action"] = 0
     user_data[chat_id]["cur_crit"] = 0
-    user_data[chat_id]["step"] = "scoring"
+    user_data[chat_id]["step"] = "typing"
 
-    ask_next_score(chat_id)
+    ask_action_type(chat_id)
 
+def ask_action_type(chat_id):
+    data = user_data[chat_id]
+    a = data["actions"][data["cur_action"]]
+    bot.send_message(
+        chat_id,
+        f"Выбери тип для действия:\n<b>{a['name']}</b>",
+        parse_mode="HTML",
+        reply_markup=action_type_kb()
+    )
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("atype:"))
+def action_type_pick(call):
+    chat_id = call.message.chat.id
+
+    if chat_id not in user_data or user_data[chat_id].get("step") != "typing":
+        bot.answer_callback_query(call.id, "Нажми /start")
+        return
+
+    t = call.data.split(":")[1]
+    data = user_data[chat_id]
+    data["actions"][data["cur_action"]]["type"] = t
+
+    bot.answer_callback_query(call.id)
+
+    data["cur_action"] += 1
+    if data["cur_action"] >= len(data["actions"]):
+        data["cur_action"] = 0
+        data["cur_crit"] = 0
+        data["step"] = "scoring"
+        ask_next_score(chat_id)
+    else:
+        ask_action_type(chat_id)
+
+# =========================
+# FLOW: SCORING
+# =========================
 def ask_next_score(chat_id):
     data = user_data[chat_id]
     a = data["actions"][data["cur_action"]]
@@ -271,7 +318,8 @@ def ask_next_score(chat_id):
 
     bot.send_message(
         chat_id,
-        f"Действие: <b>{a['name']}</b>\n\n"
+        f"Действие: <b>{a['name']}</b>\n"
+        f"Тип: <b>{type_label(a.get('type'))}</b>\n\n"
         f"Оцени: <b>{title}</b> (1–5)\n"
         f"<i>{HINTS[key]}</i>",
         parse_mode="HTML",
@@ -306,11 +354,24 @@ def score_pick(call):
     ask_next_score(chat_id)
 
 # =========================
-# RESULT (REAL SCORING)
+# RESULT (SCORING + TYPE BONUS)
 # =========================
 def energy_weight(level: str) -> float:
-    # низкая энергия -> сильнее штрафуем тяжелые дела
     return {"low": 2.0, "mid": 1.0, "high": 0.6}.get(level, 1.0)
+
+def type_bonus(action_type: str, energy_level_now: str) -> float:
+    # при низкой энергии чуть лучше рутина/умственное, хуже физическое
+    if energy_level_now != "low":
+        return 0.0
+    if action_type == "routine":
+        return 0.4
+    if action_type == "mental":
+        return 0.2
+    if action_type == "social":
+        return 0.0
+    if action_type == "physical":
+        return -0.3
+    return 0.0
 
 def show_result(chat_id):
     data = user_data[chat_id]
@@ -319,27 +380,28 @@ def show_result(chat_id):
 
     for a in data["actions"]:
         s = a["scores"]
-        # energy = затраты сил: 1 легко -> бонус 5, 5 тяжело -> бонус 1
-        energy_bonus = 6 - s["energy"]
+        energy_bonus = 6 - s["energy"]  # 1 легко -> 5 бонус, 5 тяжело -> 1 бонус
 
         a["total"] = (
             s["influence"] * 2 +
             s["urgency"] * 2 +
             s["meaning"] * 1 +
-            energy_bonus * ew
+            energy_bonus * ew +
+            type_bonus(a.get("type"), lvl)
         )
 
     best = max(data["actions"], key=lambda x: x["total"])
     data["focus"] = best["name"]
     data["step"] = "result"
 
-    db_add_event(chat_id, "picked", best["name"])
+    db_add_event(chat_id, "picked", best["name"], best.get("type"))
     db_inc_picks_today(chat_id)
 
     bot.send_message(
         chat_id,
         "🔥 <b>Главное действие сейчас:</b>\n\n"
-        f"<b>{best['name']}</b>\n\n"
+        f"<b>{best['name']}</b>\n"
+        f"Тип: <b>{type_label(best.get('type'))}</b>\n\n"
         "Сделай первый шаг за 2–5 минут (без идеала).",
         parse_mode="HTML",
         reply_markup=result_kb()
@@ -383,7 +445,7 @@ def result_actions(call):
 
         def coach():
             try:
-                bot.send_message(chat_id, "Как идёт?", reply_markup=coach_kb())
+                bot.send_message(chat_id, "⏱ Прошло 5 минут.\nКак идёт?", reply_markup=coach_kb())
             except Exception:
                 pass
 
@@ -406,9 +468,9 @@ def coach_answer(call):
     db_add_event(chat_id, f"coach_{ans}", focus)
 
     if ans == "norm":
-        bot.send_message(chat_id, "Хорошо. Продолжай ещё 10 минут или доведи до мини-результата.", reply_markup=menu_kb())
+        bot.send_message(chat_id, "🔥 Отлично. Продолжай ещё 10 минут или доведи до мини-результата.", reply_markup=menu_kb())
     elif ans == "hard":
-        bot.send_message(chat_id, "Упрости в 2 раза и начни с 2 минут. Главное — движение.", reply_markup=menu_kb())
+        bot.send_message(chat_id, "😵 Упрости в 2 раза и начни с 2 минут. Главное — движение.", reply_markup=menu_kb())
     else:
         bot.send_message(chat_id, "Ок. Можно выбрать самый маленький шаг или начать заново.", reply_markup=menu_kb())
 
