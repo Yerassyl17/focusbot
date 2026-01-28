@@ -10,128 +10,68 @@ from datetime import datetime, timedelta, timezone
 # =========================
 TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 if not TOKEN:
-    raise ValueError("BOT_TOKEN is not set. Add it in Railway Variables.")
+    raise ValueError("BOT_TOKEN is not set")
 
 bot = telebot.TeleBot(TOKEN)
+print("BOT OK:", bot.get_me().username)
 
-UNLIMITED_MODE = False                 # True = убрать лимит всем
-ADMIN_IDS = {8311003582}               # твой chat_id (только у тебя без лимита)
-
+ADMIN_IDS = {8311003582}
+UNLIMITED_MODE = False
 KZ_TZ = timezone(timedelta(hours=5))
 
 # =========================
-# DB (SQLite)
+# DB
 # =========================
 DB_PATH = "bot_data.sqlite3"
 db_lock = threading.Lock()
 
 def db_init():
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            event_type TEXT NOT NULL,
-            action TEXT,
-            action_type TEXT,
-            created_at TEXT NOT NULL
-        )
-        """)
+    with sqlite3.connect(DB_PATH) as c:
         c.execute("""
         CREATE TABLE IF NOT EXISTS daily_limits (
-            chat_id INTEGER NOT NULL,
-            day TEXT NOT NULL,
-            picks INTEGER NOT NULL,
+            chat_id INTEGER,
+            day TEXT,
+            picks INTEGER,
             PRIMARY KEY(chat_id, day)
         )
         """)
-        conn.commit()
-
-def db_add_event(chat_id, event_type, action=None, action_type=None):
-    now = datetime.now(KZ_TZ).isoformat()
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT INTO events(chat_id,event_type,action,action_type,created_at) VALUES(?,?,?,?,?)",
-            (chat_id, event_type, action, action_type, now)
-        )
-        conn.commit()
 
 def db_get_picks_today(chat_id):
     today = datetime.now(KZ_TZ).date().isoformat()
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT picks FROM daily_limits WHERE chat_id=? AND day=?", (chat_id, today))
-        row = cur.fetchone()
-        return int(row[0]) if row else 0
+    with sqlite3.connect(DB_PATH) as c:
+        r = c.execute(
+            "SELECT picks FROM daily_limits WHERE chat_id=? AND day=?",
+            (chat_id, today)
+        ).fetchone()
+        return r[0] if r else 0
 
-def db_inc_picks_today(chat_id):
+def db_inc_pick(chat_id):
     today = datetime.now(KZ_TZ).date().isoformat()
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT picks FROM daily_limits WHERE chat_id=? AND day=?", (chat_id, today))
-        if cur.fetchone():
-            cur.execute("UPDATE daily_limits SET picks=picks+1 WHERE chat_id=? AND day=?", (chat_id, today))
+    with sqlite3.connect(DB_PATH) as c:
+        if db_get_picks_today(chat_id):
+            c.execute("UPDATE daily_limits SET picks=picks+1 WHERE chat_id=? AND day=?", (chat_id, today))
         else:
-            cur.execute("INSERT INTO daily_limits(chat_id, day, picks) VALUES(?,?,1)", (chat_id, today))
-        conn.commit()
-
-def can_start_today(chat_id):
-    if UNLIMITED_MODE:
-        return True
-    if chat_id in ADMIN_IDS:
-        return True
-    return db_get_picks_today(chat_id) < 1
+            c.execute("INSERT INTO daily_limits VALUES (?,?,1)", (chat_id, today))
 
 # =========================
-# SESSION MEMORY
+# SESSION
 # =========================
-user_data = {}   # chat_id -> dict
-timers = {}      # chat_id -> {"reminder": Timer, "coach": Timer}
+user_data = {}
 
-CRITERIA = [
-    ("influence", "Влияние (польза для результата)"),
-    ("urgency",   "Срочность (насколько важно сейчас)"),
-    ("energy",    "Затраты сил (насколько тяжело сделать)"),
-    ("meaning",   "Смысл (важно лично тебе)"),
-]
-
-HINTS = {
-    "influence": "1 = почти не поможет, 5 = сильно продвинет",
-    "urgency":   "1 = можно позже, 5 = нужно сейчас/сегодня",
-    "energy":    "1 = легко, 5 = очень тяжело по силам",
-    "meaning":   "1 = не важно, 5 = очень важно для тебя",
-}
-
-def reset_session(chat_id):
+def reset(chat_id):
     user_data[chat_id] = {
-        "step": "energy",        # energy -> actions -> typing -> scoring -> result
-        "energy_now": None,      # high/mid/low
-        "actions": [],           # [{"name": str, "type": str, "scores": {}}]
+        "step": "energy",
+        "energy": None,
+        "actions": [],
         "cur_action": 0,
         "cur_crit": 0,
-        "focus": None
+        "answered_msgs": set(),
+        "expected_msg": None,
     }
-
-def cancel_timers(chat_id):
-    t = timers.get(chat_id, {})
-    for k in ("reminder", "coach"):
-        if k in t and t[k]:
-            try:
-                t[k].cancel()
-            except Exception:
-                pass
-    timers[chat_id] = {"reminder": None, "coach": None}
 
 # =========================
 # KEYBOARDS
 # =========================
-def menu_kb():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("🚀 Начать", "📊 Статистика")
-    kb.row("❓ Как пользоваться")
-    return kb
-
 def energy_kb():
     kb = types.InlineKeyboardMarkup()
     kb.row(
@@ -141,343 +81,180 @@ def energy_kb():
     )
     return kb
 
-def action_type_kb():
+def type_kb():
     kb = types.InlineKeyboardMarkup()
     kb.row(
-        types.InlineKeyboardButton("🧠 Умственное", callback_data="atype:mental"),
-        types.InlineKeyboardButton("💪 Физическое", callback_data="atype:physical"),
+        types.InlineKeyboardButton("🧠 Умственное", callback_data="type:mental"),
+        types.InlineKeyboardButton("💪 Физическое", callback_data="type:physical"),
     )
     kb.row(
-        types.InlineKeyboardButton("🗂 Рутинное", callback_data="atype:routine"),
-        types.InlineKeyboardButton("💬 Общение", callback_data="atype:social"),
+        types.InlineKeyboardButton("🗂 Рутинное", callback_data="type:routine"),
+        types.InlineKeyboardButton("💬 Общение", callback_data="type:social"),
     )
     return kb
 
 def score_kb():
     kb = types.InlineKeyboardMarkup(row_width=5)
-    kb.add(*[
-        types.InlineKeyboardButton(str(i), callback_data=f"score:{i}")
-        for i in range(1, 6)
-    ])
+    kb.add(*[types.InlineKeyboardButton(str(i), callback_data=f"score:{i}") for i in range(1, 6)])
     return kb
-
-def result_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(
-        types.InlineKeyboardButton("✅ Я начал", callback_data="result:started"),
-        types.InlineKeyboardButton("⏸ Отложить 10 минут", callback_data="result:delay"),
-        types.InlineKeyboardButton("🔁 Заново", callback_data="result:restart"),
-    )
-    return kb
-
-def coach_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("👍 Норм", callback_data="coach:norm"),
-        types.InlineKeyboardButton("😵 Тяжело", callback_data="coach:hard"),
-        types.InlineKeyboardButton("❌ Бросил", callback_data="coach:quit"),
-    )
-    return kb
-
-def type_label(t: str) -> str:
-    return {
-        "mental": "🧠 Умственное",
-        "physical": "💪 Физическое",
-        "routine": "🗂 Рутинное",
-        "social": "💬 Общение",
-    }.get(t, "—")
 
 # =========================
-# COMMANDS
+# START
 # =========================
-bot.set_my_commands([
-    telebot.types.BotCommand("start", "Начать / заново"),
-    telebot.types.BotCommand("help", "Как пользоваться"),
-    telebot.types.BotCommand("stats", "Моя статистика"),
-])
-
 @bot.message_handler(commands=["start"])
-def start_cmd(message):
-    chat_id = message.chat.id
-    cancel_timers(chat_id)
-
-    if not can_start_today(chat_id):
-        bot.send_message(chat_id,
-                         "⛔ Сегодня уже был 1 выбор.\nЗавтра можно снова.",
-                         reply_markup=menu_kb())
+def start(m):
+    chat_id = m.chat.id
+    if not UNLIMITED_MODE and chat_id not in ADMIN_IDS and db_get_picks_today(chat_id):
+        bot.send_message(chat_id, "⛔ Сегодня уже был выбор")
         return
 
-    reset_session(chat_id)
+    reset(chat_id)
     bot.send_message(chat_id, "Твоя энергия сейчас?", reply_markup=energy_kb())
-    bot.send_message(chat_id, "Меню:", reply_markup=menu_kb())
-
-@bot.message_handler(commands=["help"])
-def help_cmd(message):
-    bot.send_message(
-        message.chat.id,
-        "Я помогаю выбрать ОДНО главное действие.\n\n"
-        "1) /start или 🚀 Начать\n"
-        "2) Выбери энергию\n"
-        "3) Напиши 3–7 действий\n"
-        "4) Для каждого выбери тип\n"
-        "5) Оцени по 4 критериям (1–5)\n\n"
-        "⛔ 1 выбор в день (кроме админа).",
-        reply_markup=menu_kb()
-    )
-
-@bot.message_handler(commands=["stats"])
-def stats_cmd(message):
-    chat_id = message.chat.id
-    picks = db_get_picks_today(chat_id)
-    bot.send_message(chat_id, f"Сегодня выборов: {picks}", reply_markup=menu_kb())
-
-@bot.message_handler(func=lambda m: m.text in ["🚀 Начать", "📊 Статистика", "❓ Как пользоваться"])
-def menu_handler(message):
-    if message.text == "📊 Статистика":
-        stats_cmd(message)
-    elif message.text == "❓ Как пользоваться":
-        help_cmd(message)
-    else:
-        start_cmd(message)
 
 # =========================
-# FLOW: ENERGY
+# ENERGY
 # =========================
 @bot.callback_query_handler(func=lambda c: c.data.startswith("energy:"))
-def energy_pick(call):
-    chat_id = call.message.chat.id
-
-    if chat_id not in user_data:
-        reset_session(chat_id)
-
-    user_data[chat_id]["energy_now"] = call.data.split(":")[1]
+def energy_pick(c):
+    chat_id = c.message.chat.id
+    user_data[chat_id]["energy"] = c.data.split(":")[1]
     user_data[chat_id]["step"] = "actions"
-
-    bot.answer_callback_query(call.id)
-    bot.send_message(chat_id, "Напиши 3–7 действий, каждое с новой строки.")
+    bot.answer_callback_query(c.id)
+    bot.send_message(chat_id, "Напиши 3–7 действий, каждое с новой строки")
 
 # =========================
-# FLOW: ACTIONS INPUT
+# ACTIONS INPUT
 # =========================
-@bot.message_handler(func=lambda m: m.chat.id in user_data and user_data[m.chat.id].get("step") == "actions")
-def get_actions(message):
-    chat_id = message.chat.id
-    lines = [a.strip() for a in message.text.split("\n") if a.strip()]
-
+@bot.message_handler(func=lambda m: m.chat.id in user_data and user_data[m.chat.id]["step"] == "actions")
+def get_actions(m):
+    chat_id = m.chat.id
+    lines = [x.strip() for x in m.text.split("\n") if x.strip()]
     if not 3 <= len(lines) <= 7:
-        bot.send_message(chat_id, "Нужно 3–7 действий. Каждое с новой строки.")
+        bot.send_message(chat_id, "Нужно 3–7 действий")
         return
 
-    user_data[chat_id]["actions"] = [{"name": a, "type": None, "scores": {}} for a in lines]
-    user_data[chat_id]["cur_action"] = 0
-    user_data[chat_id]["cur_crit"] = 0
+    user_data[chat_id]["actions"] = [{"name": x, "type": None, "scores": {}} for x in lines]
     user_data[chat_id]["step"] = "typing"
+    ask_type(chat_id)
 
-    ask_action_type(chat_id)
-
-def ask_action_type(chat_id):
-    data = user_data[chat_id]
-    a = data["actions"][data["cur_action"]]
-    bot.send_message(
+def ask_type(chat_id):
+    a = user_data[chat_id]["actions"][user_data[chat_id]["cur_action"]]
+    msg = bot.send_message(
         chat_id,
         f"Выбери тип для действия:\n<b>{a['name']}</b>",
         parse_mode="HTML",
-        reply_markup=action_type_kb()
+        reply_markup=type_kb()
     )
+    user_data[chat_id]["expected_msg"] = msg.message_id
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("atype:"))
-def action_type_pick(call):
-    chat_id = call.message.chat.id
+# =========================
+# TYPE PICK (LOCKED)
+# =========================
+@bot.callback_query_handler(func=lambda c: c.data.startswith("type:"))
+def pick_type(c):
+    chat_id = c.message.chat.id
+    data = user_data.get(chat_id)
 
-    if chat_id not in user_data or user_data[chat_id].get("step") != "typing":
-        bot.answer_callback_query(call.id, "Нажми /start")
+    if not data or data["step"] != "typing":
+        bot.answer_callback_query(c.id, "Нажми /start")
         return
 
-    t = call.data.split(":")[1]
-    data = user_data[chat_id]
-    data["actions"][data["cur_action"]]["type"] = t
+    if c.message.message_id != data["expected_msg"]:
+        bot.answer_callback_query(c.id, "Это старое сообщение")
+        return
 
-    bot.answer_callback_query(call.id)
+    if c.message.message_id in data["answered_msgs"]:
+        bot.answer_callback_query(c.id, "Уже выбрано")
+        return
+
+    t = c.data.split(":")[1]
+    a = data["actions"][data["cur_action"]]
+    a["type"] = t
+
+    data["answered_msgs"].add(c.message.message_id)
+
+    bot.edit_message_reply_markup(chat_id, c.message.message_id, reply_markup=None)
+    bot.edit_message_text(
+        chat_id,
+        c.message.message_id,
+        f"✅ Тип выбран: <b>{t}</b>\n\n<b>{a['name']}</b>",
+        parse_mode="HTML"
+    )
 
     data["cur_action"] += 1
+    bot.answer_callback_query(c.id)
+
     if data["cur_action"] >= len(data["actions"]):
+        data["step"] = "scoring"
         data["cur_action"] = 0
         data["cur_crit"] = 0
-        data["step"] = "scoring"
-        ask_next_score(chat_id)
+        ask_score(chat_id)
     else:
-        ask_action_type(chat_id)
+        ask_type(chat_id)
 
 # =========================
-# FLOW: SCORING
+# SCORING
 # =========================
-def ask_next_score(chat_id):
-    data = user_data[chat_id]
-    a = data["actions"][data["cur_action"]]
-    key, title = CRITERIA[data["cur_crit"]]
+CRITS = ["influence", "urgency", "energy", "meaning"]
+CRIT_TITLES = {
+    "influence": "Влияние",
+    "urgency": "Срочность",
+    "energy": "Затраты сил",
+    "meaning": "Смысл",
+}
 
+def ask_score(chat_id):
+    d = user_data[chat_id]
+    a = d["actions"][d["cur_action"]]
+    crit = CRITS[d["cur_crit"]]
     bot.send_message(
         chat_id,
-        f"Действие: <b>{a['name']}</b>\n"
-        f"Тип: <b>{type_label(a.get('type'))}</b>\n\n"
-        f"Оцени: <b>{title}</b> (1–5)\n"
-        f"<i>{HINTS[key]}</i>",
+        f"{a['name']}\nОцени: <b>{CRIT_TITLES[crit]}</b> (1–5)",
         parse_mode="HTML",
         reply_markup=score_kb()
     )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("score:"))
-def score_pick(call):
-    chat_id = call.message.chat.id
-    score = int(call.data.split(":")[1])
+def score_pick(c):
+    chat_id = c.message.chat.id
+    d = user_data[chat_id]
+    a = d["actions"][d["cur_action"]]
+    crit = CRITS[d["cur_crit"]]
+    a["scores"][crit] = int(c.data.split(":")[1])
 
-    if chat_id not in user_data or user_data[chat_id].get("step") != "scoring":
-        bot.answer_callback_query(call.id, "Нажми /start")
-        return
+    d["cur_crit"] += 1
+    bot.answer_callback_query(c.id)
 
-    data = user_data[chat_id]
-    a = data["actions"][data["cur_action"]]
-    key, _ = CRITERIA[data["cur_crit"]]
-    a["scores"][key] = score
-
-    data["cur_crit"] += 1
-    if data["cur_crit"] >= len(CRITERIA):
-        data["cur_crit"] = 0
-        data["cur_action"] += 1
-
-        if data["cur_action"] >= len(data["actions"]):
-            bot.answer_callback_query(call.id)
-            show_result(chat_id)
+    if d["cur_crit"] >= len(CRITS):
+        d["cur_crit"] = 0
+        d["cur_action"] += 1
+        if d["cur_action"] >= len(d["actions"]):
+            finish(chat_id)
             return
 
-    bot.answer_callback_query(call.id)
-    ask_next_score(chat_id)
+    ask_score(chat_id)
 
 # =========================
-# RESULT (SCORING + TYPE BONUS)
+# RESULT
 # =========================
-def energy_weight(level: str) -> float:
-    return {"low": 2.0, "mid": 1.0, "high": 0.6}.get(level, 1.0)
-
-def type_bonus(action_type: str, energy_level_now: str) -> float:
-    # при низкой энергии чуть лучше рутина/умственное, хуже физическое
-    if energy_level_now != "low":
-        return 0.0
-    if action_type == "routine":
-        return 0.4
-    if action_type == "mental":
-        return 0.2
-    if action_type == "social":
-        return 0.0
-    if action_type == "physical":
-        return -0.3
-    return 0.0
-
-def show_result(chat_id):
-    data = user_data[chat_id]
-    lvl = data.get("energy_now", "mid")
-    ew = energy_weight(lvl)
-
-    for a in data["actions"]:
+def finish(chat_id):
+    d = user_data[chat_id]
+    for a in d["actions"]:
         s = a["scores"]
-        energy_bonus = 6 - s["energy"]  # 1 легко -> 5 бонус, 5 тяжело -> 1 бонус
+        a["total"] = s["influence"]*2 + s["urgency"]*2 + s["meaning"] + (6-s["energy"])
 
-        a["total"] = (
-            s["influence"] * 2 +
-            s["urgency"] * 2 +
-            s["meaning"] * 1 +
-            energy_bonus * ew +
-            type_bonus(a.get("type"), lvl)
-        )
-
-    best = max(data["actions"], key=lambda x: x["total"])
-    data["focus"] = best["name"]
-    data["step"] = "result"
-
-    db_add_event(chat_id, "picked", best["name"], best.get("type"))
-    db_inc_picks_today(chat_id)
+    best = max(d["actions"], key=lambda x: x["total"])
+    db_inc_pick(chat_id)
 
     bot.send_message(
         chat_id,
-        "🔥 <b>Главное действие сейчас:</b>\n\n"
-        f"<b>{best['name']}</b>\n"
-        f"Тип: <b>{type_label(best.get('type'))}</b>\n\n"
-        "Сделай первый шаг за 2–5 минут (без идеала).",
-        parse_mode="HTML",
-        reply_markup=result_kb()
+        f"🔥 <b>Главное действие:</b>\n\n<b>{best['name']}</b>",
+        parse_mode="HTML"
     )
 
 # =========================
-# RESULT BUTTONS
-# =========================
-@bot.callback_query_handler(func=lambda c: c.data.startswith("result:"))
-def result_actions(call):
-    chat_id = call.message.chat.id
-    focus = user_data.get(chat_id, {}).get("focus", "это действие")
-    cmd = call.data.split(":")[1]
-
-    bot.answer_callback_query(call.id)
-
-    if cmd == "restart":
-        start_cmd(call.message)
-        return
-
-    if cmd == "delay":
-        def remind():
-            try:
-                bot.send_message(chat_id, f"⏰ Напоминание:\n<b>{focus}</b>", parse_mode="HTML")
-                db_add_event(chat_id, "reminder_sent", focus)
-            except Exception:
-                pass
-
-        cancel_timers(chat_id)
-        t = threading.Timer(10 * 60, remind)
-        timers[chat_id]["reminder"] = t
-        t.start()
-
-        db_add_event(chat_id, "delayed_10m", focus)
-        bot.send_message(chat_id, "Ок, напомню через 10 минут.", reply_markup=menu_kb())
-        return
-
-    if cmd == "started":
-        db_add_event(chat_id, "started", focus)
-        bot.send_message(chat_id, "Отлично! Через 5 минут спрошу, как идёт.", reply_markup=menu_kb())
-
-        def coach():
-            try:
-                bot.send_message(chat_id, "⏱ Прошло 5 минут.\nКак идёт?", reply_markup=coach_kb())
-            except Exception:
-                pass
-
-        cancel_timers(chat_id)
-        t = threading.Timer(5 * 60, coach)
-        timers[chat_id]["coach"] = t
-        t.start()
-        return
-
-# =========================
-# COACH ANSWER
-# =========================
-@bot.callback_query_handler(func=lambda c: c.data.startswith("coach:"))
-def coach_answer(call):
-    chat_id = call.message.chat.id
-    ans = call.data.split(":")[1]
-    focus = user_data.get(chat_id, {}).get("focus")
-
-    bot.answer_callback_query(call.id)
-    db_add_event(chat_id, f"coach_{ans}", focus)
-
-    if ans == "norm":
-        bot.send_message(chat_id, "🔥 Отлично. Продолжай ещё 10 минут или доведи до мини-результата.", reply_markup=menu_kb())
-    elif ans == "hard":
-        bot.send_message(chat_id, "😵 Упрости в 2 раза и начни с 2 минут. Главное — движение.", reply_markup=menu_kb())
-    else:
-        bot.send_message(chat_id, "Ок. Можно выбрать самый маленький шаг или начать заново.", reply_markup=menu_kb())
-
-# =========================
-# START
+# RUN
 # =========================
 if __name__ == "__main__":
     db_init()
-    print("Бот запущен")
     bot.infinity_polling(skip_pending=True)
