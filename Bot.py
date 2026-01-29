@@ -24,6 +24,7 @@ KZ_TZ = timezone(timedelta(hours=5))
 DB_PATH = "bot_data.sqlite3"
 db_lock = threading.Lock()
 
+
 def db_init():
     with db_lock, sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
@@ -46,6 +47,7 @@ def db_init():
         """)
         conn.commit()
 
+
 def db_add_event(chat_id, event_type, action=None):
     now = datetime.now(KZ_TZ).isoformat()
     with db_lock, sqlite3.connect(DB_PATH) as conn:
@@ -55,6 +57,7 @@ def db_add_event(chat_id, event_type, action=None):
         )
         conn.commit()
 
+
 def db_get_picks_today(chat_id):
     today = datetime.now(KZ_TZ).date().isoformat()
     with db_lock, sqlite3.connect(DB_PATH) as conn:
@@ -62,6 +65,7 @@ def db_get_picks_today(chat_id):
         cur.execute("SELECT picks FROM daily_limits WHERE chat_id=? AND day=?", (chat_id, today))
         row = cur.fetchone()
         return int(row[0]) if row else 0
+
 
 def db_inc_picks_today(chat_id):
     today = datetime.now(KZ_TZ).date().isoformat()
@@ -74,6 +78,7 @@ def db_inc_picks_today(chat_id):
             cur.execute("INSERT INTO daily_limits(chat_id, day, picks) VALUES(?,?,1)", (chat_id, today))
         conn.commit()
 
+
 def can_start_today(chat_id):
     if UNLIMITED_MODE:
         return True
@@ -81,8 +86,9 @@ def can_start_today(chat_id):
         return True
     return db_get_picks_today(chat_id) < 1
 
+
 # =========================
-# SESSION MEMORY
+# SESSION + TIMERS
 # =========================
 user_data = {}
 timers = {}
@@ -101,24 +107,30 @@ HINTS = {
     "meaning":   "1 = не важно, 5 = очень важно для тебя",
 }
 
+
 def reset_session(chat_id):
     user_data[chat_id] = {
-        "step": "energy",
-        "energy_now": None,
+        # flow states: idle -> energy -> actions -> typing -> scoring -> result / delayed / started
+        "step": "idle",
 
-        # energy lock
+        "energy_now": None,
         "energy_msg_id": None,
         "energy_locked": False,
 
         "actions": [],
         "cur_action": 0,
         "cur_crit": 0,
-        "focus": None,
 
-        # type lock
         "expected_type_msg_id": None,
         "answered_type_msgs": set(),
+
+        "focus": None,
+        "result_locked": False,   # чтобы на результат не нажимали дважды
+        "result_msg_id": None,    # id сообщения "Главное действие..."
+
+        "last_result_at": None,
     }
+
 
 def cancel_timers(chat_id):
     t = timers.get(chat_id, {})
@@ -130,14 +142,34 @@ def cancel_timers(chat_id):
                 pass
     timers[chat_id] = {"reminder": None, "coach": None}
 
+
 # =========================
 # KEYBOARDS
 # =========================
+def hide_kb():
+    return types.ReplyKeyboardRemove(selective=False)
+
+
 def menu_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🚀 Начать", "📊 Статистика")
     kb.row("❓ Как пользоваться")
     return kb
+
+
+def result_reply_kb(full=True):
+    """
+    full=True  -> ✅ Я начал / ⏸ Отложить / 🕒 Попозже / 🔁 Заново
+    full=False -> 🕒 Попозже / 🔁 Заново  (например после 'Отложить 10 минут')
+    """
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    if full:
+        kb.row("✅ Я начал", "⏸ Отложить 10 минут")
+        kb.row("🕒 Попозже сделаю", "🔁 Заново")
+    else:
+        kb.row("🕒 Попозже сделаю", "🔁 Заново")
+    return kb
+
 
 def energy_kb():
     kb = types.InlineKeyboardMarkup()
@@ -148,31 +180,6 @@ def energy_kb():
     )
     return kb
 
-def score_kb():
-    kb = types.InlineKeyboardMarkup(row_width=5)
-    kb.add(*[
-        types.InlineKeyboardButton(str(i), callback_data=f"score:{i}")
-        for i in range(1, 6)
-    ])
-    return kb
-
-def result_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(
-        types.InlineKeyboardButton("✅ Я начал", callback_data="result:started"),
-        types.InlineKeyboardButton("⏸ Отложить 10 минут", callback_data="result:delay"),
-        types.InlineKeyboardButton("🔁 Заново", callback_data="result:restart"),
-    )
-    return kb
-
-def coach_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("👍 Норм", callback_data="coach:norm"),
-        types.InlineKeyboardButton("😵 Тяжело", callback_data="coach:hard"),
-        types.InlineKeyboardButton("❌ Бросил", callback_data="coach:quit"),
-    )
-    return kb
 
 def action_type_kb():
     kb = types.InlineKeyboardMarkup()
@@ -186,6 +193,16 @@ def action_type_kb():
     )
     return kb
 
+
+def score_kb():
+    kb = types.InlineKeyboardMarkup(row_width=5)
+    kb.add(*[
+        types.InlineKeyboardButton(str(i), callback_data=f"score:{i}")
+        for i in range(1, 6)
+    ])
+    return kb
+
+
 def type_label(t: str) -> str:
     return {
         "mental": "🧠 Умственное",
@@ -194,8 +211,10 @@ def type_label(t: str) -> str:
         "social": "💬 Общение",
     }.get(t, t)
 
+
 def energy_label(lvl: str) -> str:
-    return {"high":"🔋 Высокая", "mid":"😐 Средняя", "low":"🪫 Низкая"}.get(lvl, lvl)
+    return {"high": "🔋 Высокая", "mid": "😐 Средняя", "low": "🪫 Низкая"}.get(lvl, lvl)
+
 
 # =========================
 # COMMANDS
@@ -205,6 +224,7 @@ bot.set_my_commands([
     telebot.types.BotCommand("help", "Как пользоваться"),
     telebot.types.BotCommand("stats", "Моя статистика"),
 ])
+
 
 @bot.message_handler(commands=["start"])
 def start_cmd(message):
@@ -216,31 +236,37 @@ def start_cmd(message):
         return
 
     reset_session(chat_id)
+    data = user_data[chat_id]
+    data["step"] = "energy"
+
+    # убираем нижнее меню на время сценария
+    bot.send_message(chat_id, "Запускаю выбор ✅", reply_markup=hide_kb())
 
     msg = bot.send_message(chat_id, "Твоя энергия сейчас?", reply_markup=energy_kb())
-    user_data[chat_id]["energy_msg_id"] = msg.message_id
+    data["energy_msg_id"] = msg.message_id
 
-    bot.send_message(chat_id, "Меню:", reply_markup=menu_kb())
 
 @bot.message_handler(commands=["help"])
 def help_cmd(message):
     bot.send_message(
         message.chat.id,
-        "Я помогаю выбрать ОДНО главное действие.\n\n"
+        "Я помогу выбрать ОДНО главное действие.\n\n"
         "1) /start или 🚀 Начать\n"
-        "2) Выбери энергию\n"
-        "3) Напиши 3–7 действий\n"
-        "4) Для каждого действия выбери тип\n"
-        "5) Оцени по 4 критериям (1–5)\n\n"
-        "⛔ 1 выбор в день (кроме админа).",
+        "2) Выбираешь энергию\n"
+        "3) Пишешь 3–7 действий (каждое с новой строки)\n"
+        "4) Для каждого действия выбираешь тип\n"
+        "5) Оцениваешь по 4 критериям (1–5)\n\n"
+        "После результата управление снизу: ✅ Я начал / ⏸ Отложить / 🕒 Попозже / 🔁 Заново",
         reply_markup=menu_kb()
     )
+
 
 @bot.message_handler(commands=["stats"])
 def stats_cmd(message):
     chat_id = message.chat.id
     picks = db_get_picks_today(chat_id)
     bot.send_message(chat_id, f"Сегодня выборов: {picks}", reply_markup=menu_kb())
+
 
 @bot.message_handler(func=lambda m: m.text in ["🚀 Начать", "📊 Статистика", "❓ Как пользоваться"])
 def menu_handler(message):
@@ -251,6 +277,7 @@ def menu_handler(message):
     else:
         start_cmd(message)
 
+
 # =========================
 # ENERGY (LOCKED)
 # =========================
@@ -259,10 +286,11 @@ def energy_pick(call):
     chat_id = call.message.chat.id
     data = user_data.get(chat_id)
 
-    if not data:
+    if not data or data.get("step") != "energy":
         bot.answer_callback_query(call.id, "Нажми /start")
         return
 
+    # только на актуальное сообщение энергии
     if data["energy_msg_id"] is not None and call.message.message_id != data["energy_msg_id"]:
         bot.answer_callback_query(call.id, "Это старое сообщение")
         return
@@ -276,6 +304,7 @@ def energy_pick(call):
     data["energy_locked"] = True
     data["step"] = "actions"
 
+    # убираем кнопки энергии и фиксируем текст
     try:
         bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
     except Exception:
@@ -286,13 +315,14 @@ def energy_pick(call):
             chat_id=chat_id,
             message_id=call.message.message_id,
             text=f"✅ Энергия: <b>{energy_label(lvl)}</b>",
-            parse_mode="HTML",
+            parse_mode="HTML"
         )
     except Exception:
         pass
 
-    bot.answer_callback_query(call.id, "Ок ✅")
-    bot.send_message(chat_id, "Напиши 3–7 действий, каждое с новой строки.")
+    bot.answer_callback_query(call.id)
+    bot.send_message(chat_id, "Напиши 3–7 действий, каждое с новой строки.", reply_markup=hide_kb())
+
 
 # =========================
 # ACTIONS INPUT
@@ -316,6 +346,7 @@ def get_actions(message):
 
     ask_action_type(chat_id)
 
+
 def ask_action_type(chat_id):
     data = user_data[chat_id]
     a = data["actions"][data["cur_action"]]
@@ -326,11 +357,11 @@ def ask_action_type(chat_id):
         parse_mode="HTML",
         reply_markup=action_type_kb()
     )
+
+    # только это сообщение теперь можно “отвечать”
     data["expected_type_msg_id"] = msg.message_id
 
-# =========================
-# TYPE PICK (LOCKED + VISIBLE)
-# =========================
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("atype:"))
 def action_type_pick(call):
     chat_id = call.message.chat.id
@@ -340,6 +371,7 @@ def action_type_pick(call):
         bot.answer_callback_query(call.id, "Нажми /start")
         return
 
+    # старые сообщения не принимаем
     if data["expected_type_msg_id"] is not None and call.message.message_id != data["expected_type_msg_id"]:
         bot.answer_callback_query(call.id, "Это старое сообщение")
         return
@@ -354,12 +386,12 @@ def action_type_pick(call):
 
     data["answered_type_msgs"].add(call.message.message_id)
 
+    # убираем кнопки + показываем итог рядом с действием
     try:
         bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
     except Exception:
         pass
 
-    # Вот тут будет видно рядом: "ДЕЙСТВИЕ — ТИП"
     try:
         bot.edit_message_text(
             chat_id=chat_id,
@@ -381,6 +413,7 @@ def action_type_pick(call):
     else:
         ask_action_type(chat_id)
 
+
 # =========================
 # SCORING
 # =========================
@@ -399,16 +432,17 @@ def ask_next_score(chat_id):
         reply_markup=score_kb()
     )
 
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("score:"))
 def score_pick(call):
     chat_id = call.message.chat.id
-    score = int(call.data.split(":")[1])
-
     data = user_data.get(chat_id)
+
     if not data or data.get("step") != "scoring":
         bot.answer_callback_query(call.id, "Нажми /start")
         return
 
+    score = int(call.data.split(":")[1])
     a = data["actions"][data["cur_action"]]
     key, _ = CRITERIA[data["cur_crit"]]
     a["scores"][key] = score
@@ -423,14 +457,16 @@ def score_pick(call):
             show_result(chat_id)
             return
 
-    bot.answer_callback_query(call.id, "Ок ✅")
+    bot.answer_callback_query(call.id)
     ask_next_score(chat_id)
 
+
 # =========================
-# RESULT
+# RESULT + CONTROL (REPLY KEYBOARD)
 # =========================
 def energy_weight(level: str) -> float:
     return {"low": 2.0, "mid": 1.0, "high": 0.6}.get(level, 1.0)
+
 
 def show_result(chat_id):
     data = user_data[chat_id]
@@ -439,7 +475,7 @@ def show_result(chat_id):
 
     for a in data["actions"]:
         s = a["scores"]
-        energy_bonus = 6 - s["energy"]
+        energy_bonus = 6 - s["energy"]  # 1 легко -> бонус 5
         a["total"] = (
             s["influence"] * 2 +
             s["urgency"] * 2 +
@@ -450,103 +486,185 @@ def show_result(chat_id):
     best = max(data["actions"], key=lambda x: x["total"])
     data["focus"] = best["name"]
     data["step"] = "result"
+    data["result_locked"] = False
 
     db_add_event(chat_id, "picked", best["name"])
     db_inc_picks_today(chat_id)
 
-    bot.send_message(
+    msg = bot.send_message(
         chat_id,
         "🔥 <b>Главное действие сейчас:</b>\n\n"
         f"<b>{best['name']}</b>\n"
         f"Тип: <b>{type_label(best['type'])}</b>\n\n"
         "Сделай первый шаг за 2–5 минут (без идеала).",
         parse_mode="HTML",
-        reply_markup=result_kb()
+        reply_markup=result_reply_kb(full=True)  # ВАЖНО: управление снизу
     )
+    data["result_msg_id"] = msg.message_id
 
-# =========================
-# RESULT BUTTONS ✅ (ЭТОГО У ТЕБЯ НЕ БЫЛО)
-# =========================
-@bot.callback_query_handler(func=lambda c: c.data.startswith("result:"))
-def result_actions(call):
-    chat_id = call.message.chat.id
+
+def lock_result_controls(chat_id, next_kb):
+    """
+    Убирает/заменяет нижнюю клавиатуру так, чтобы нельзя было нажимать старые варианты.
+    """
+    try:
+        bot.send_message(chat_id, " ", reply_markup=next_kb)
+    except Exception:
+        pass
+
+
+@bot.message_handler(func=lambda m: m.chat.id in user_data and m.text in [
+    "✅ Я начал", "⏸ Отложить 10 минут", "🕒 Попозже сделаю", "🔁 Заново"
+])
+def result_reply_handler(message):
+    chat_id = message.chat.id
     data = user_data.get(chat_id)
-
     if not data:
-        bot.answer_callback_query(call.id, "Сессия сбросилась. Нажми /start")
+        bot.send_message(chat_id, "Нажми /start", reply_markup=menu_kb())
         return
 
-    focus = data.get("focus", "это действие")
-    cmd = call.data.split(":")[1]
-
-    bot.answer_callback_query(call.id)
-
-    if cmd == "restart":
-        start_cmd(call.message)
+    # Разрешаем эти кнопки только в result/delayed/started (не в процессе ввода/оценок)
+    if data.get("step") not in ("result", "delayed", "started"):
+        bot.send_message(chat_id, "Сначала дойди до результата 🙂", reply_markup=hide_kb())
         return
 
-    if cmd == "delay":
+    focus = data.get("focus") or "это действие"
+
+    # защита от двойных нажатий
+    if data.get("result_locked") and message.text != "🔁 Заново":
+        bot.send_message(chat_id, "✅ Уже принято", reply_markup=menu_kb())
+        return
+
+    if message.text == "🔁 Заново":
+        # перезапуск — всегда разрешён
+        db_add_event(chat_id, "restart", focus)
+        cancel_timers(chat_id)
+        start_cmd(message)
+        return
+
+    if message.text == "🕒 Попозже сделаю":
+        data["result_locked"] = True
+        data["step"] = "idle"
+        db_add_event(chat_id, "postpone_free", focus)
+
+        cancel_timers(chat_id)
+        bot.send_message(chat_id, "Ок 👍 Сделаешь позже. Если захочешь — жми 🚀 Начать.", reply_markup=menu_kb())
+        return
+
+    if message.text == "⏸ Отложить 10 минут":
+        data["result_locked"] = True
+        data["step"] = "delayed"
+        db_add_event(chat_id, "delayed_10m", focus)
+
+        cancel_timers(chat_id)
+
         def remind():
             try:
-                bot.send_message(chat_id, f"⏰ Напоминание:\n<b>{focus}</b>", parse_mode="HTML")
+                bot.send_message(
+                    chat_id,
+                    f"⏰ Напоминание:\n<b>{focus}</b>\n\nГотов начать? 🙂",
+                    parse_mode="HTML",
+                    reply_markup=result_reply_kb(full=True)
+                )
+                # после напоминания снова можно выбирать
+                if chat_id in user_data:
+                    user_data[chat_id]["step"] = "result"
+                    user_data[chat_id]["result_locked"] = False
                 db_add_event(chat_id, "reminder_sent", focus)
             except Exception:
                 pass
 
-        cancel_timers(chat_id)
         t = threading.Timer(10 * 60, remind)
         timers[chat_id]["reminder"] = t
         t.start()
 
-        db_add_event(chat_id, "delayed_10m", focus)
-        bot.send_message(chat_id, "Ок, напомню через 10 минут.", reply_markup=menu_kb())
+        # ВАЖНО: сразу убираем варианты ✅Я начал / ⏸ / ...
+        # оставляем только "попозже" и "заново" пока 10 минут не прошло
+        bot.send_message(chat_id, "Ок, напомню через 10 минут.", reply_markup=result_reply_kb(full=False))
         return
 
-    if cmd == "started":
+    if message.text == "✅ Я начал":
+        data["result_locked"] = True
+        data["step"] = "started"
         db_add_event(chat_id, "started", focus)
-        bot.send_message(chat_id, "Отлично! Через 5 минут спрошу, как идёт.", reply_markup=menu_kb())
+
+        cancel_timers(chat_id)
+        bot.send_message(chat_id, "Отлично! Через 5 минут спрошу, как идёт.", reply_markup=hide_kb())
 
         def coach():
             try:
-                bot.send_message(chat_id, "Как идёт?", reply_markup=coach_kb())
+                bot.send_message(chat_id, "Как идёт?", reply_markup=coach_inline_kb())
             except Exception:
                 pass
 
-        cancel_timers(chat_id)
         t = threading.Timer(5 * 60, coach)
         timers[chat_id]["coach"] = t
         t.start()
         return
 
-# ✅ Поддержка старых кнопок (если где-то остались в чате)
-@bot.callback_query_handler(func=lambda c: c.data in ["started", "delay", "restart"])
-def old_result_actions(call):
-    call.data = "result:" + call.data
-    result_actions(call)
 
 # =========================
-# COACH ANSWER ✅ (ЭТОГО У ТЕБЯ НЕ БЫЛО)
+# COACH (INLINE)
 # =========================
+def coach_inline_kb():
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("👍 Норм", callback_data="coach:norm"),
+        types.InlineKeyboardButton("😵 Тяжело", callback_data="coach:hard"),
+        types.InlineKeyboardButton("❌ Бросил", callback_data="coach:quit"),
+    )
+    return kb
+
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("coach:"))
 def coach_answer(call):
     chat_id = call.message.chat.id
-    data = user_data.get(chat_id)
-    if not data:
-        bot.answer_callback_query(call.id, "Нажми /start")
-        return
-
+    data = user_data.get(chat_id, {})
     ans = call.data.split(":")[1]
     focus = data.get("focus")
 
     bot.answer_callback_query(call.id)
     db_add_event(chat_id, f"coach_{ans}", focus)
 
+    # убираем кнопки, чтобы не нажимали повторно
+    try:
+        bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+
     if ans == "norm":
-        bot.send_message(chat_id, "Хорошо. Продолжай ещё 10 минут или доведи до мини-результата.", reply_markup=menu_kb())
+        bot.send_message(chat_id, "Хорошо. Продолжай ещё 10 минут или доведи до мини-результата ✅", reply_markup=menu_kb())
     elif ans == "hard":
-        bot.send_message(chat_id, "Упрости в 2 раза и начни с 2 минут. Главное — движение.", reply_markup=menu_kb())
+        bot.send_message(chat_id, "Упрости в 2 раза и начни с 2 минут. Главное — движение 💪", reply_markup=menu_kb())
     else:
-        bot.send_message(chat_id, "Ок. Можно выбрать самый маленький шаг или начать заново.", reply_markup=menu_kb())
+        bot.send_message(chat_id, "Ок. Можно выбрать самый маленький шаг или начать заново 🔁", reply_markup=menu_kb())
+
+    # возвращаемся в idle (меню)
+    if chat_id in user_data:
+        user_data[chat_id]["step"] = "idle"
+
+
+# =========================
+# FALLBACK: если пишут не в тот момент
+# =========================
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def fallback(message):
+    chat_id = message.chat.id
+    data = user_data.get(chat_id)
+
+    # если вообще нет сессии — показываем меню
+    if not data:
+        bot.send_message(chat_id, "Выбери:", reply_markup=menu_kb())
+        return
+
+    # если пользователь в процессе, но пишет что-то не по шагу
+    if data.get("step") in ("energy", "typing", "scoring"):
+        bot.send_message(chat_id, "Следуй шагам 🙂", reply_markup=hide_kb())
+        return
+
+    # idle
+    bot.send_message(chat_id, "Выбери:", reply_markup=menu_kb())
+
 
 # =========================
 # RUN
