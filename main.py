@@ -7,30 +7,33 @@ from datetime import datetime, timedelta, timezone
 import telebot
 from telebot import types
 
-# Gemini (Google Gen AI SDK)
-# pip install -U google-genai
-from google import genai  # :contentReference[oaicite:2]{index=2}
-
 # =========================
 # CONFIG
 # =========================
 TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 if not TOKEN:
-    raise ValueError("BOT_TOKEN is not set. Add it in Railway/Render Variables.")
+    raise ValueError("BOT_TOKEN is not set. Add it in Railway Variables.")
 
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is not set. Add it in Railway/Render Variables.")
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()  # optional
 
-bot = telebot.TeleBot(TOKEN)
-gemini = genai.Client(api_key=GEMINI_API_KEY)  # :contentReference[oaicite:3]{index=3}
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
 UNLIMITED_MODE = False
 ADMIN_IDS = {8311003582}  # твой chat_id
+
 KZ_TZ = timezone(timedelta(hours=5))
 
-# Gemini model (можно поменять при желании)
-GEMINI_MODEL = "gemini-2.0-flash"
+# =========================
+# OPTIONAL: OpenAI client
+# =========================
+openai_client = None
+if OPENAI_API_KEY:
+    try:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        print("OpenAI init error:", e)
+        openai_client = None
 
 # =========================
 # DB (SQLite)
@@ -99,28 +102,50 @@ def can_start_today(chat_id):
 # SESSION MEMORY
 # =========================
 user_data = {}   # chat_id -> dict
-timers = {}      # chat_id -> {"reminder": Timer|None, "coach": Timer|None}
+timers = {}      # chat_id -> dict of timers
+
+CRITERIA = [
+    ("influence", "Влияние (польза для результата)"),
+    ("urgency",   "Срочность (насколько важно сейчас)"),
+    ("energy",    "Затраты сил (насколько тяжело сделать)"),
+    ("meaning",   "Смысл (важно лично тебе)"),
+]
+
+HINTS = {
+    "influence": "1 = почти не поможет, 5 = сильно продвинет",
+    "urgency":   "1 = можно позже, 5 = нужно сейчас/сегодня",
+    "energy":    "1 = легко, 5 = очень тяжело по силам",
+    "meaning":   "1 = не важно, 5 = очень важно для тебя",
+}
 
 def reset_session(chat_id):
     user_data[chat_id] = {
-        "state": "energy",          # energy -> actions -> typing -> ai_result -> done
-        "energy": None,
+        "step": "energy",
+        "energy_now": None,
 
-        # lock messages
+        # ENERGY lock
         "energy_msg_id": None,
         "energy_locked": False,
 
-        "actions": [],              # [{"name": str, "type": str|None}]
+        # ACTIONS + TYPE
+        "actions": [],                # [{"name":..., "type":..., "scores":{...}}]
         "cur_action": 0,
+        "cur_crit": 0,
 
+        # TYPE lock
         "expected_type_msg_id": None,
         "answered_type_msgs": set(),
 
-        # result
+        # SCORING lock
+        "expected_score_msg_id": None,
+        "answered_score_msgs": set(),
+
+        # RESULT
         "focus": None,
-        "focus_type": None,
         "result_msg_id": None,
-        "result_locked": False,
+        "delayed_control_msg_id": None,
+
+        "picked_logged": False,  # чтобы daily limit инкрементнулся один раз
     }
 
 def cancel_timers(chat_id):
@@ -134,18 +159,19 @@ def cancel_timers(chat_id):
     timers[chat_id] = {"reminder": None, "coach": None}
 
 # =========================
-# UI HELPERS
+# UI helpers
 # =========================
-def type_label(t: str) -> str:
-    return {
-        "mental": "🧠 Умственное",
-        "physical": "💪 Физическое",
-        "routine": "🗂 Рутинное",
-        "social": "💬 Общение",
-    }.get(t or "", t or "—")
+def remove_menu():
+    return types.ReplyKeyboardRemove()
 
-def energy_label(e: str) -> str:
-    return {"high": "🔋 Высокая", "mid": "😐 Средняя", "low": "🪫 Низкая"}.get(e or "", e or "—")
+def menu_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("🚀 Начать", "📊 Статистика")
+    kb.row("❓ Как пользоваться")
+    return kb
+
+def energy_label(lvl: str) -> str:
+    return {"high":"🔋 Высокая", "mid":"😐 Средняя", "low":"🪫 Низкая"}.get(lvl, lvl)
 
 def energy_kb():
     kb = types.InlineKeyboardMarkup()
@@ -168,26 +194,37 @@ def action_type_kb():
     )
     return kb
 
+def type_label(t: str) -> str:
+    return {
+        "mental": "🧠 Умственное",
+        "physical": "💪 Физическое",
+        "routine": "🗂 Рутинное",
+        "social": "💬 Общение",
+    }.get(t, t or "—")
+
+def score_kb():
+    kb = types.InlineKeyboardMarkup(row_width=5)
+    kb.add(*[
+        types.InlineKeyboardButton(str(i), callback_data=f"score:{i}")
+        for i in range(1, 6)
+    ])
+    return kb
+
 def result_kb():
     kb = types.InlineKeyboardMarkup()
-    kb.row(
+    kb.add(
         types.InlineKeyboardButton("✅ Я начал", callback_data="result:started"),
-        types.InlineKeyboardButton("⏸ Отложить 10 минут", callback_data="result:delay"),
-    )
-    kb.row(
+        types.InlineKeyboardButton("⏸ Отложить 10 минут", callback_data="result:delay10"),
         types.InlineKeyboardButton("🔁 Заново", callback_data="result:restart"),
     )
     return kb
 
-def delay_kb():
-    # появляется ПОСЛЕ "Отложить", чтобы можно было отметить "Я начал" даже до напоминания
+def delayed_control_kb():
     kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("✅ Я начал", callback_data="delay:started"),
-        types.InlineKeyboardButton("⏭ Попозже (ещё 10 минут)", callback_data="delay:more"),
-    )
-    kb.row(
-        types.InlineKeyboardButton("🔁 Заново", callback_data="delay:restart"),
+    kb.add(
+        types.InlineKeyboardButton("✅ Я начал", callback_data="delayctl:started"),
+        types.InlineKeyboardButton("🕒 Позже сделаю", callback_data="delayctl:later"),
+        types.InlineKeyboardButton("🔁 Заново", callback_data="delayctl:restart"),
     )
     return kb
 
@@ -201,68 +238,104 @@ def coach_kb():
     return kb
 
 # =========================
-# GEMINI LOGIC
+# AI pick (OpenAI)
 # =========================
-def gemini_pick_best(energy: str, actions: list[dict]) -> dict:
+def ai_pick_best_action(energy: str, actions: list[dict]) -> str | None:
     """
-    actions: [{"name": "...", "type": "mental|physical|routine|social"}]
-    returns:
-      {"best_index": int, "first_step": str, "why": str}
+    actions: [{"name":..., "type":..., "scores":{...}}]
+    return: action name or None
     """
-    payload = {
-        "energy": energy,
-        "actions": actions,
-        "instruction": (
-            "Ты productivity-коуч. Выбери ОДНО лучшее действие на ближайшие 10-30 минут.\n"
-            "Учитывай энергию: low=бережно, high=можно сложнее.\n"
-            "Верни строго JSON: {best_index:int, first_step:string, why:string}.\n"
-            "first_step = очень маленький шаг (2-5 минут). why = 1-2 предложения.\n"
-            "Никаких лишних ключей, только эти 3."
-        )
-    }
-
-    resp = gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[json.dumps(payload, ensure_ascii=False)]
-    )
-
-    text = getattr(resp, "text", "") or ""
-    # иногда модель оборачивает в ```json ... ```
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        cleaned = cleaned.replace("json", "", 1).strip()
+    if not openai_client:
+        return None
 
     try:
-        data = json.loads(cleaned)
-        if not isinstance(data, dict):
-            raise ValueError("Gemini returned non-dict")
-        if "best_index" not in data or "first_step" not in data or "why" not in data:
-            raise ValueError("Gemini returned wrong keys")
-        return data
-    except Exception:
-        # fallback: простейшая логика
-        return {
-            "best_index": 0,
-            "first_step": "Сделай самый маленький шаг: подготовь всё на 2 минуты.",
-            "why": "Gemini не вернул корректный JSON, использую запасной вариант."
+        payload = {
+            "energy": energy,
+            "instruction": (
+                "Выбери ОДНО действие, которое лучше всего сделать прямо сейчас. "
+                "Учитывай энергию и тип действий. Верни ТОЛЬКО точное название одного действия из списка."
+            ),
+            "actions": [
+                {
+                    "name": a["name"],
+                    "type": a.get("type"),
+                    "scores": a.get("scores", {}),
+                } for a in actions
+            ]
         }
+
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Ты ассистент по продуктивности. Отвечай максимально коротко и точно."},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+            ],
+            temperature=0.2
+        )
+
+        answer = (resp.choices[0].message.content or "").strip()
+        # строгая проверка: совпадение с названием из списка
+        names = [a["name"] for a in actions]
+        for n in names:
+            if n.lower() == answer.lower():
+                return n
+        # мягкая проверка: если модель добавила символы
+        for n in names:
+            if n.lower() in answer.lower():
+                return n
+
+        return None
+
+    except Exception as e:
+        print("AI ERROR:", e)
+        return None
+
+# =========================
+# Local scoring fallback
+# =========================
+def energy_weight(level: str) -> float:
+    return {"low": 2.0, "mid": 1.0, "high": 0.6}.get(level, 1.0)
+
+def local_pick_best(data: dict) -> dict:
+    lvl = data.get("energy_now", "mid")
+    ew = energy_weight(lvl)
+
+    for a in data["actions"]:
+        s = a["scores"]
+        energy_bonus = 6 - s["energy"]  # 1 легко -> 5 бонус
+        a["total"] = (
+            s["influence"] * 2 +
+            s["urgency"] * 2 +
+            s["meaning"] * 1 +
+            energy_bonus * ew
+        )
+
+    return max(data["actions"], key=lambda x: x["total"])
 
 # =========================
 # COMMANDS
 # =========================
+bot.set_my_commands([
+    telebot.types.BotCommand("start", "Начать / заново"),
+    telebot.types.BotCommand("help", "Как пользоваться"),
+    telebot.types.BotCommand("stats", "Моя статистика"),
+])
+
 @bot.message_handler(commands=["start"])
 def start_cmd(message):
     chat_id = message.chat.id
     cancel_timers(chat_id)
 
+    # Лимит в день
     if not can_start_today(chat_id):
-        bot.send_message(chat_id, "⛔ Сегодня уже был 1 выбор.\nЗавтра можно снова.")
+        bot.send_message(chat_id, "⛔ Сегодня уже был 1 выбор.\nЗавтра можно снова.", reply_markup=menu_kb())
         return
 
     reset_session(chat_id)
 
-    # НЕ показываем меню — только сценарий
+    # меню можно показать, но дальше мы его уберём
+    bot.send_message(chat_id, "Меню:", reply_markup=menu_kb())
+
     msg = bot.send_message(chat_id, "Твоя энергия сейчас?", reply_markup=energy_kb())
     user_data[chat_id]["energy_msg_id"] = msg.message_id
 
@@ -270,21 +343,31 @@ def start_cmd(message):
 def help_cmd(message):
     bot.send_message(
         message.chat.id,
-        "Команды:\n"
-        "/start — начать выбор\n"
-        "/stats — статистика\n\n"
-        "Сценарий:\n"
-        "1) Выбираешь энергию (фиксируется)\n"
-        "2) Пишешь 3–7 действий (каждое с новой строки)\n"
-        "3) Для каждого действия выбираешь тип (фиксируется)\n"
-        "4) Gemini выбирает лучшее действие и даёт первый шаг 🤖"
+        "Я помогаю выбрать ОДНО главное действие.\n\n"
+        "1) /start или 🚀 Начать\n"
+        "2) Выбери энергию (фиксируется)\n"
+        "3) Напиши 3–7 действий\n"
+        "4) Для каждого действия выбери тип (фиксируется)\n"
+        "5) Оцени по 4 критериям (фиксируется)\n"
+        "6) Получишь результат + кнопки управления\n\n"
+        "⛔ 1 выбор в день (кроме админа).",
+        reply_markup=menu_kb()
     )
 
 @bot.message_handler(commands=["stats"])
 def stats_cmd(message):
     chat_id = message.chat.id
     picks = db_get_picks_today(chat_id)
-    bot.send_message(chat_id, f"Сегодня выборов: {picks}")
+    bot.send_message(chat_id, f"Сегодня выборов: {picks}", reply_markup=menu_kb())
+
+@bot.message_handler(func=lambda m: m.text in ["🚀 Начать", "📊 Статистика", "❓ Как пользоваться"])
+def menu_handler(message):
+    if message.text == "📊 Статистика":
+        stats_cmd(message)
+    elif message.text == "❓ Как пользоваться":
+        help_cmd(message)
+    else:
+        start_cmd(message)
 
 # =========================
 # ENERGY (LOCKED)
@@ -293,11 +376,11 @@ def stats_cmd(message):
 def energy_pick(call):
     chat_id = call.message.chat.id
     data = user_data.get(chat_id)
+
     if not data:
         bot.answer_callback_query(call.id, "Нажми /start")
         return
 
-    # принимаем только по последнему energy_msg_id
     if data["energy_msg_id"] and call.message.message_id != data["energy_msg_id"]:
         bot.answer_callback_query(call.id, "Это старое сообщение")
         return
@@ -307,44 +390,49 @@ def energy_pick(call):
         return
 
     lvl = call.data.split(":")[1]
-    data["energy"] = lvl
+    data["energy_now"] = lvl
     data["energy_locked"] = True
-    data["state"] = "actions"
+    data["step"] = "actions"
 
-    # убираем кнопки + пишем выбранное
+    # скрыть меню снизу, чтобы не мешало
+    bot.send_message(chat_id, "✅ Принято", reply_markup=remove_menu())
+
+    # убрать кнопки энергии + показать выбор
     try:
-        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+        bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
     except Exception:
         pass
+
     try:
         bot.edit_message_text(
-            f"✅ Энергия: <b>{energy_label(lvl)}</b>",
-            chat_id,
-            call.message.message_id,
-            parse_mode="HTML"
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text=f"✅ Энергия: <b>{energy_label(lvl)}</b>"
         )
     except Exception:
         pass
 
     bot.answer_callback_query(call.id)
-    bot.send_message(chat_id, "Напиши 3–7 действий, каждое с новой строки.")
+    bot.send_message(chat_id, "Напиши 3–7 действий, каждое с новой строки.", reply_markup=remove_menu())
 
 # =========================
 # ACTIONS INPUT
 # =========================
-@bot.message_handler(func=lambda m: m.chat.id in user_data and user_data[m.chat.id].get("state") == "actions")
+@bot.message_handler(func=lambda m: m.chat.id in user_data and user_data[m.chat.id].get("step") == "actions")
 def get_actions(message):
     chat_id = message.chat.id
     data = user_data[chat_id]
 
-    lines = [a.strip() for a in (message.text or "").split("\n") if a.strip()]
+    lines = [a.strip() for a in message.text.split("\n") if a.strip()]
     if not 3 <= len(lines) <= 7:
-        bot.send_message(chat_id, "Нужно 3–7 действий. Каждое с новой строки.")
+        bot.send_message(chat_id, "Нужно 3–7 действий. Каждое с новой строки.", reply_markup=remove_menu())
         return
 
-    data["actions"] = [{"name": a, "type": None} for a in lines]
+    data["actions"] = [{"name": a, "type": None, "scores": {}} for a in lines]
     data["cur_action"] = 0
-    data["state"] = "typing"
+    data["cur_crit"] = 0
+    data["step"] = "typing"
+
     data["expected_type_msg_id"] = None
     data["answered_type_msgs"].clear()
 
@@ -357,19 +445,19 @@ def ask_action_type(chat_id):
     msg = bot.send_message(
         chat_id,
         f"Выбери тип для действия:\n<b>{a['name']}</b>",
-        parse_mode="HTML",
         reply_markup=action_type_kb()
     )
     data["expected_type_msg_id"] = msg.message_id
 
 # =========================
-# TYPE PICK (LOCKED + VISUAL)
+# TYPE PICK (LOCKED + only latest message valid)
 # =========================
 @bot.callback_query_handler(func=lambda c: c.data.startswith("atype:"))
 def action_type_pick(call):
     chat_id = call.message.chat.id
     data = user_data.get(chat_id)
-    if not data or data.get("state") != "typing":
+
+    if not data or data.get("step") != "typing":
         bot.answer_callback_query(call.id, "Нажми /start")
         return
 
@@ -378,7 +466,7 @@ def action_type_pick(call):
         bot.answer_callback_query(call.id, "Это старое сообщение")
         return
 
-    # нельзя переответить
+    # нельзя менять
     if call.message.message_id in data["answered_type_msgs"]:
         bot.answer_callback_query(call.id, "✅ Уже выбрано")
         return
@@ -386,220 +474,294 @@ def action_type_pick(call):
     t = call.data.split(":")[1]
     a = data["actions"][data["cur_action"]]
     a["type"] = t
+
     data["answered_type_msgs"].add(call.message.message_id)
 
-    # убрать кнопки + показать "Действие — Тип"
+    # убрать кнопки и показать "действие — тип"
     try:
-        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+        bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
     except Exception:
         pass
+
     try:
         bot.edit_message_text(
-            f"✅ <b>{a['name']}</b> — <b>{type_label(t)}</b>",
-            chat_id,
-            call.message.message_id,
-            parse_mode="HTML"
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text=f"✅ <b>{a['name']}</b> — <b>{type_label(t)}</b>"
         )
     except Exception:
         pass
 
     bot.answer_callback_query(call.id, "Готово ✅")
 
-    # следующее действие или AI-результат
     data["cur_action"] += 1
     if data["cur_action"] >= len(data["actions"]):
-        data["state"] = "ai_result"
-        show_ai_result(chat_id)
+        data["cur_action"] = 0
+        data["cur_crit"] = 0
+        data["step"] = "scoring"
+        data["expected_score_msg_id"] = None
+        data["answered_score_msgs"].clear()
+        ask_next_score(chat_id)
     else:
         ask_action_type(chat_id)
 
 # =========================
-# AI RESULT
+# SCORING (LOCKED)
 # =========================
-def show_ai_result(chat_id):
+def ask_next_score(chat_id):
     data = user_data[chat_id]
+    a = data["actions"][data["cur_action"]]
+    key, title = CRITERIA[data["cur_crit"]]
 
-    # лимит "1 выбор в день" фиксируем ТОЛЬКО когда дошли до результата
-    db_inc_picks_today(chat_id)
+    msg = bot.send_message(
+        chat_id,
+        f"Действие: <b>{a['name']}</b>\n"
+        f"Тип: <b>{type_label(a['type'])}</b>\n\n"
+        f"Оцени: <b>{title}</b> (1–5)\n"
+        f"<i>{HINTS[key]}</i>",
+        reply_markup=score_kb()
+    )
+    data["expected_score_msg_id"] = msg.message_id
 
-    actions = data["actions"]
-    energy = data["energy"]
+@bot.callback_query_handler(func=lambda c: c.data.startswith("score:"))
+def score_pick(call):
+    chat_id = call.message.chat.id
+    data = user_data.get(chat_id)
 
-    pick = gemini_pick_best(energy=energy, actions=actions)
-    idx = int(pick.get("best_index", 0))
-    idx = max(0, min(idx, len(actions) - 1))
+    if not data or data.get("step") != "scoring":
+        bot.answer_callback_query(call.id, "Нажми /start")
+        return
 
-    best = actions[idx]
+    # только актуальное сообщение
+    if data["expected_score_msg_id"] and call.message.message_id != data["expected_score_msg_id"]:
+        bot.answer_callback_query(call.id, "Это старое сообщение")
+        return
+
+    # нельзя менять
+    if call.message.message_id in data["answered_score_msgs"]:
+        bot.answer_callback_query(call.id, "✅ Уже выбрано")
+        return
+
+    score = int(call.data.split(":")[1])
+    a = data["actions"][data["cur_action"]]
+    key, title = CRITERIA[data["cur_crit"]]
+    a["scores"][key] = score
+
+    data["answered_score_msgs"].add(call.message.message_id)
+
+    # убрать кнопки и показать зафиксированный ответ
+    try:
+        bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text=(
+                f"✅ <b>{a['name']}</b>\n"
+                f"Тип: <b>{type_label(a['type'])}</b>\n"
+                f"{title}: <b>{score}</b>"
+            )
+        )
+    except Exception:
+        pass
+
+    bot.answer_callback_query(call.id, "Ок ✅")
+
+    data["cur_crit"] += 1
+    if data["cur_crit"] >= len(CRITERIA):
+        data["cur_crit"] = 0
+        data["cur_action"] += 1
+
+        if data["cur_action"] >= len(data["actions"]):
+            show_result(chat_id)
+            return
+
+    ask_next_score(chat_id)
+
+# =========================
+# RESULT
+# =========================
+def show_result(chat_id):
+    data = user_data[chat_id]
+    data["step"] = "result"
+
+    # 1) попытка ИИ
+    ai_name = ai_pick_best_action(data.get("energy_now", "mid"), data["actions"])
+    if ai_name:
+        best = next(a for a in data["actions"] if a["name"] == ai_name)
+        db_add_event(chat_id, "picked_ai", best["name"])
+        header = "🤖 <b>ИИ выбрал главное действие:</b>"
+    else:
+        best = local_pick_best(data)
+        db_add_event(chat_id, "picked_local", best["name"])
+        header = "🔥 <b>Главное действие сейчас:</b>"
+
     data["focus"] = best["name"]
-    data["focus_type"] = best["type"]
-    data["state"] = "done"
-    data["result_locked"] = False
 
-    db_add_event(chat_id, "picked_ai", best["name"])
+    # daily limit (1 раз)
+    if not data["picked_logged"]:
+        db_inc_picks_today(chat_id)
+        data["picked_logged"] = True
 
     text = (
-        "🔥 <b>Главное действие сейчас:</b>\n\n"
+        f"{header}\n\n"
         f"<b>{best['name']}</b>\n"
-        f"Тип: <b>{type_label(best['type'])}</b>\n\n"
-        f"🚀 <b>Первый шаг (2–5 минут):</b>\n{pick.get('first_step','')}\n\n"
-        f"🧩 <i>{pick.get('why','')}</i>"
+        f"Тип: <b>{type_label(best.get('type'))}</b>\n\n"
+        "Сделай первый шаг за 2–5 минут (без идеала)."
     )
 
-    msg = bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=result_kb())
+    msg = bot.send_message(chat_id, text, reply_markup=result_kb())
     data["result_msg_id"] = msg.message_id
 
 # =========================
-# RESULT BUTTONS (LOCK + HIDE)
+# RESULT BUTTONS (WORKING)
 # =========================
 @bot.callback_query_handler(func=lambda c: c.data.startswith("result:"))
 def result_actions(call):
     chat_id = call.message.chat.id
     data = user_data.get(chat_id)
-    if not data or data.get("state") != "done":
+
+    if not data or data.get("step") != "result":
         bot.answer_callback_query(call.id, "Нажми /start")
         return
 
-    # только актуальное result-сообщение
-    if data["result_msg_id"] and call.message.message_id != data["result_msg_id"]:
+    # принимаем только актуальное result-сообщение
+    if data.get("result_msg_id") and call.message.message_id != data["result_msg_id"]:
         bot.answer_callback_query(call.id, "Это старое сообщение")
         return
 
-    if data["result_locked"]:
-        bot.answer_callback_query(call.id, "✅ Уже обработано")
-        return
-
     cmd = call.data.split(":")[1]
-    focus = data.get("focus") or "действие"
-    ftype = type_label(data.get("focus_type"))
+    focus = data.get("focus", "это действие")
 
-    # lock + hide buttons
-    data["result_locked"] = True
+    # всегда фиксируем: после нажатия — убрать кнопки у результата
     try:
-        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+        bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
     except Exception:
         pass
 
-    bot.answer_callback_query(call.id)
-
     if cmd == "restart":
-        # полный рестарт
-        bot.send_message(chat_id, "Ок, начнём заново. Нажми /start")
-        return
-
-    if cmd == "delay":
-        db_add_event(chat_id, "delayed_10m", focus)
-
-        # обновим текст результата
-        try:
-            bot.edit_message_text(
-                f"⏸ Отложено на 10 минут:\n<b>{focus}</b>\nТип: <b>{ftype}</b>",
-                chat_id,
-                call.message.message_id,
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-        # запланировать напоминание
-        def remind():
-            try:
-                bot.send_message(chat_id, f"⏰ Напоминание:\n<b>{focus}</b>\nТип: <b>{ftype}</b>", parse_mode="HTML")
-                db_add_event(chat_id, "reminder_sent", focus)
-            except Exception:
-                pass
-
+        bot.answer_callback_query(call.id, "Ок")
         cancel_timers(chat_id)
-        t = threading.Timer(10 * 60, remind)
-        timers[chat_id]["reminder"] = t
-        t.start()
-
-        # ВАЖНО: вместо меню — показываем “Я начал / Попозже / Заново”
-        bot.send_message(chat_id, "Ок, напомню через 10 минут.", reply_markup=delay_kb())
+        # внутренний рестарт (без проверки лимита)
+        reset_session(chat_id)
+        bot.send_message(chat_id, "🔁 Ок, начнём заново. Твоя энергия сейчас?", reply_markup=energy_kb())
+        user_data[chat_id]["energy_msg_id"] = call.message.message_id + 1  # не идеально, но не мешает
         return
 
     if cmd == "started":
+        bot.answer_callback_query(call.id, "🔥 Погнали")
+        cancel_timers(chat_id)
+
         db_add_event(chat_id, "started", focus)
 
         # обновим текст результата
         try:
             bot.edit_message_text(
-                f"✅ Начал:\n<b>{focus}</b>\nТип: <b>{ftype}</b>\n\nЧерез 5 минут спрошу, как идёт.",
-                chat_id,
-                call.message.message_id,
-                parse_mode="HTML"
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                text=f"✅ Ты начал: <b>{focus}</b>\n\nЧерез 5 минут спрошу, как идёт."
             )
         except Exception:
             pass
 
-        # таймер коуча
         def coach():
             try:
                 bot.send_message(chat_id, "Как идёт?", reply_markup=coach_kb())
             except Exception:
                 pass
 
-        cancel_timers(chat_id)
         t = threading.Timer(5 * 60, coach)
-        timers[chat_id]["coach"] = t
+        timers.setdefault(chat_id, {})["coach"] = t
         t.start()
-
-        # не показываем меню
         return
 
-# =========================
-# AFTER DELAY CONTROLS
-# =========================
-@bot.callback_query_handler(func=lambda c: c.data.startswith("delay:"))
-def delay_actions(call):
-    chat_id = call.message.chat.id
-    data = user_data.get(chat_id)
-    if not data:
-        bot.answer_callback_query(call.id, "Нажми /start")
-        return
+    if cmd == "delay10":
+        bot.answer_callback_query(call.id, "Ок")
 
-    focus = data.get("focus") or "действие"
-    ftype = type_label(data.get("focus_type"))
+        data["step"] = "delayed"
 
-    cmd = call.data.split(":")[1]
+        # обновим текст результата
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                text=f"⏸ Отложено на 10 минут: <b>{focus}</b>\n\nЯ напомню через 10 минут."
+            )
+        except Exception:
+            pass
 
-    # убираем кнопки на сообщении "Ок, напомню..."
-    try:
-        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-    except Exception:
-        pass
-
-    bot.answer_callback_query(call.id)
-
-    if cmd == "restart":
-        bot.send_message(chat_id, "Ок, начнём заново. Нажми /start")
-        return
-
-    if cmd == "more":
-        db_add_event(chat_id, "delayed_more_10m", focus)
-
+        # напоминание таймером
         def remind():
             try:
-                bot.send_message(chat_id, f"⏰ Напоминание:\n<b>{focus}</b>\nТип: <b>{ftype}</b>", parse_mode="HTML")
+                bot.send_message(chat_id, f"⏰ Напоминание: <b>{focus}</b>")
                 db_add_event(chat_id, "reminder_sent", focus)
             except Exception:
                 pass
 
         cancel_timers(chat_id)
         t = threading.Timer(10 * 60, remind)
-        timers[chat_id]["reminder"] = t
+        timers.setdefault(chat_id, {})["reminder"] = t
         t.start()
 
-        bot.send_message(chat_id, "Ок, ещё +10 минут. Если начнёшь раньше — нажми ✅", reply_markup=delay_kb())
+        db_add_event(chat_id, "delayed_10m", focus)
+
+        # управление после задержки (и ДО истечения 10 минут) — как ты хотел
+        ctl = bot.send_message(
+            chat_id,
+            "Выбери, что дальше:",
+            reply_markup=delayed_control_kb()
+        )
+        data["delayed_control_msg_id"] = ctl.message_id
         return
 
+# =========================
+# DELAY CONTROL (started/later/restart)
+# =========================
+@bot.callback_query_handler(func=lambda c: c.data.startswith("delayctl:"))
+def delay_control(call):
+    chat_id = call.message.chat.id
+    data = user_data.get(chat_id)
+
+    if not data or data.get("step") != "delayed":
+        bot.answer_callback_query(call.id, "Нажми /start")
+        return
+
+    if data.get("delayed_control_msg_id") and call.message.message_id != data["delayed_control_msg_id"]:
+        bot.answer_callback_query(call.id, "Это старое сообщение")
+        return
+
+    focus = data.get("focus", "это действие")
+    cmd = call.data.split(":")[1]
+
+    # убрать кнопки
+    try:
+        bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+
     if cmd == "started":
+        bot.answer_callback_query(call.id, "🔥 Погнали")
+        # отменяем напоминание
+        try:
+            timers.get(chat_id, {}).get("reminder") and timers[chat_id]["reminder"].cancel()
+        except Exception:
+            pass
+
+        data["step"] = "coaching"
+
         db_add_event(chat_id, "started_after_delay", focus)
 
-        bot.send_message(
-            chat_id,
-            f"✅ Начал:\n<b>{focus}</b>\nТип: <b>{ftype}</b>\n\nЧерез 5 минут спрошу, как идёт.",
-            parse_mode="HTML"
-        )
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                text=f"✅ Ты начал: <b>{focus}</b>\n\nЧерез 5 минут спрошу, как идёт."
+            )
+        except Exception:
+            pass
 
         def coach():
             try:
@@ -607,10 +769,40 @@ def delay_actions(call):
             except Exception:
                 pass
 
-        cancel_timers(chat_id)
         t = threading.Timer(5 * 60, coach)
-        timers[chat_id]["coach"] = t
+        timers.setdefault(chat_id, {})["coach"] = t
         t.start()
+        return
+
+    if cmd == "later":
+        bot.answer_callback_query(call.id, "Ок")
+        # отменяем напоминание
+        try:
+            timers.get(chat_id, {}).get("reminder") and timers[chat_id]["reminder"].cancel()
+        except Exception:
+            pass
+
+        data["step"] = "idle"
+        db_add_event(chat_id, "later_done", focus)
+
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                text=f"🕒 Ок, сделаешь позже: <b>{focus}</b>\n\nХочешь — можешь начать заново из меню."
+            )
+        except Exception:
+            pass
+
+        # возвращаем меню (теперь сценарий завершён)
+        bot.send_message(chat_id, "Меню:", reply_markup=menu_kb())
+        return
+
+    if cmd == "restart":
+        bot.answer_callback_query(call.id, "Ок")
+        cancel_timers(chat_id)
+        reset_session(chat_id)
+        bot.send_message(chat_id, "🔁 Ок, начнём заново. Твоя энергия сейчас?", reply_markup=energy_kb())
         return
 
 # =========================
@@ -620,28 +812,23 @@ def delay_actions(call):
 def coach_answer(call):
     chat_id = call.message.chat.id
     data = user_data.get(chat_id)
-    if not data:
-        bot.answer_callback_query(call.id, "Нажми /start")
-        return
+    focus = (data or {}).get("focus")
 
     ans = call.data.split(":")[1]
-    focus = data.get(chat_id, {}).get("focus") if isinstance(data, dict) else None
-
     bot.answer_callback_query(call.id)
+
     db_add_event(chat_id, f"coach_{ans}", focus)
 
-    # убираем кнопки коуча
-    try:
-        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-    except Exception:
-        pass
-
+    # после коуча — завершаем сценарий и возвращаем меню
     if ans == "norm":
-        bot.send_message(chat_id, "👍 Отлично. Продолжай ещё 10 минут или доведи до мини-результата.")
+        bot.send_message(chat_id, "👍 Хорошо. Продолжай ещё 10 минут или доведи до мини-результата.", reply_markup=menu_kb())
     elif ans == "hard":
-        bot.send_message(chat_id, "😵 Упрости в 2 раза и начни с 2 минут. Главное — движение.")
+        bot.send_message(chat_id, "😵 Упрости в 2 раза и начни с 2 минут. Главное — движение.", reply_markup=menu_kb())
     else:
-        bot.send_message(chat_id, "Ок. Можно выбрать самый маленький шаг или начать заново: /start")
+        bot.send_message(chat_id, "❌ Ок. Можно выбрать самый маленький шаг или начать заново.", reply_markup=menu_kb())
+
+    if data:
+        data["step"] = "idle"
 
 # =========================
 # RUN
