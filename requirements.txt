@@ -1,1 +1,2 @@
-pyTelegramBotAPI==4.30.0
+pyTelegramBotAPI
+google-genai
