@@ -9,24 +9,24 @@ from telebot import types
 # =========================
 # CONFIG
 # =========================
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
-
 KZ_TZ = timezone(timedelta(hours=5))
 
 # =========================
 # DATABASE
 # =========================
 DB = "data.sqlite3"
+db_lock = threading.Lock()
 
 def db():
     return sqlite3.connect(DB, check_same_thread=False)
 
 def init_db():
-    with db() as c:
+    with db_lock, db() as c:
         c.execute("""
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,30 +39,62 @@ def init_db():
         c.commit()
 
 def log(chat_id, event, value=None):
-    with db() as c:
+    with db_lock, db() as c:
         c.execute(
             "INSERT INTO logs(chat_id,event,value,created_at) VALUES(?,?,?,?)",
             (chat_id, event, value, datetime.now(KZ_TZ).isoformat())
         )
         c.commit()
 
+def count_today(chat_id, event):
+    today = datetime.now(KZ_TZ).date().isoformat()
+    with db_lock, db() as c:
+        cur = c.cursor()
+        cur.execute("""
+            SELECT COUNT(*) FROM logs
+            WHERE chat_id=? AND event=? AND substr(created_at,1,10)=?
+        """, (chat_id, event, today))
+        return int(cur.fetchone()[0])
+
 # =========================
 # SESSION MEMORY
 # =========================
-sessions = {}
-timers = {}
+sessions = {}   # chat_id -> session dict
+timers = {}     # chat_id -> {"remind": Timer, "progress": Timer}
+
+def cancel_timer(chat_id, key):
+    t = timers.get(chat_id, {}).get(key)
+    if t:
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    timers.setdefault(chat_id, {})[key] = None
+
+def cancel_all(chat_id):
+    cancel_timer(chat_id, "remind")
+    cancel_timer(chat_id, "progress")
+
+def new_session(chat_id):
+    sessions[chat_id] = {
+        "step": "energy",     # energy -> actions -> type -> score -> result
+        "energy": None,       # 'high'/'mid'/'low'
+        "actions": [],
+        "cur": 0,
+        "crit": 0,
+        "focus": None
+    }
 
 # =========================
 # UI
 # =========================
+MENU_TEXTS = {"🚀 Начать", "⏸ Отложить", "📊 Статистика", "❓ Как пользоваться"}
+
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🚀 Начать", "⏸ Отложить")
     kb.row("📊 Статистика", "❓ Как пользоваться")
     return kb
-
-def remove():
-    return types.ReplyKeyboardRemove()
 
 def energy_kb():
     kb = types.InlineKeyboardMarkup()
@@ -72,6 +104,9 @@ def energy_kb():
         types.InlineKeyboardButton("🪫 Низкая", callback_data="energy:low"),
     )
     return kb
+
+def energy_label(code: str) -> str:
+    return {"high":"🔋 Высокая", "mid":"😐 Средняя", "low":"🪫 Низкая"}.get(code, code)
 
 def type_kb():
     kb = types.InlineKeyboardMarkup()
@@ -84,6 +119,14 @@ def type_kb():
         types.InlineKeyboardButton("💬 Общение", callback_data="type:social"),
     )
     return kb
+
+def type_label(t: str) -> str:
+    return {
+        "mental": "🧠 Умственное",
+        "physical": "💪 Физическое",
+        "routine": "🗂 Рутинное",
+        "social": "💬 Общение",
+    }.get(t, t)
 
 def score_kb():
     kb = types.InlineKeyboardMarkup(row_width=5)
@@ -115,17 +158,19 @@ def progress_kb():
 # =========================
 CRITERIA = ["Влияние", "Срочность", "Затраты сил", "Смысл"]
 
-def pick_best(actions, energy):
-    weight = {"low": 2, "mid": 1, "high": 0.6}.get(energy, 1)
+def pick_best(actions, energy_code):
+    # energy_code: low/mid/high
+    weight = {"low": 2.0, "mid": 1.0, "high": 0.6}.get(energy_code, 1.0)
+
     best = None
-    best_score = -1
+    best_score = -10**9
 
     for a in actions:
-        s = a["scores"]
+        s = a["scores"]  # [influence, urgency, energy_cost, meaning]
         score = (
             s[0] * 2 +
             s[1] * 2 +
-            s[3] +
+            s[3] * 1 +
             (6 - s[2]) * weight
         )
         if score > best_score:
@@ -135,31 +180,92 @@ def pick_best(actions, energy):
     return best
 
 # =========================
+# MENU HANDLER (ВАЖНО: ДОЛЖЕН БЫТЬ ВЫШЕ step-хэндлеров)
+# =========================
+@bot.message_handler(func=lambda m: (m.text or "") in MENU_TEXTS)
+def menu_handler(m):
+    txt = (m.text or "").strip()
+    chat_id = m.chat.id
+
+    if txt == "🚀 Начать":
+        start_flow(chat_id)
+        return
+
+    if txt == "❓ Как пользоваться":
+        help_flow(chat_id)
+        return
+
+    if txt == "📊 Статистика":
+        stats_flow(chat_id)
+        return
+
+    if txt == "⏸ Отложить":
+        s = sessions.get(chat_id)
+        if not s or not s.get("focus"):
+            bot.send_message(chat_id, "⏸ Пока нечего откладывать — сначала сделай выбор через 🚀 Начать.", reply_markup=menu())
+            return
+
+        focus = s["focus"]
+        cancel_timer(chat_id, "remind")
+
+        bot.send_message(chat_id, f"⏸ Ок, отложил на 10 минут: <b>{focus}</b>\nЯ напомню.", reply_markup=menu())
+        log(chat_id, "delayed_menu", focus)
+
+        def remind():
+            try:
+                bot.send_message(chat_id, f"⏰ Напоминание: <b>{focus}</b>\nНажми 🚀 Начать или продолжай это действие.", reply_markup=menu())
+                log(chat_id, "reminder_sent", focus)
+            except Exception:
+                pass
+
+        t = threading.Timer(10 * 60, remind)
+        timers.setdefault(chat_id, {})["remind"] = t
+        t.start()
+
+# =========================
 # COMMANDS
 # =========================
 @bot.message_handler(commands=["start"])
 def start_cmd(m):
-    sessions[m.chat.id] = {
-        "step": "energy",
-        "energy": None,
-        "actions": [],
-        "cur": 0,
-        "crit": 0,
-        "focus": None
-    }
-    bot.send_message(m.chat.id, "Твоя энергия сейчас?", reply_markup=energy_kb())
-    bot.send_message(m.chat.id, "Меню:", reply_markup=menu())
+    start_flow(m.chat.id)
 
-@bot.message_handler(func=lambda m: m.text == "❓ Как пользоваться")
+@bot.message_handler(commands=["help"])
 def help_cmd(m):
+    help_flow(m.chat.id)
+
+@bot.message_handler(commands=["stats"])
+def stats_cmd(m):
+    stats_flow(m.chat.id)
+
+def start_flow(chat_id):
+    cancel_all(chat_id)
+    new_session(chat_id)
+    bot.send_message(chat_id, "Твоя энергия сейчас?", reply_markup=energy_kb())
+    bot.send_message(chat_id, "Меню:", reply_markup=menu())
+    log(chat_id, "start_flow", "ok")
+
+def help_flow(chat_id):
     bot.send_message(
-        m.chat.id,
+        chat_id,
         "Я помогаю выбрать одно главное действие.\n\n"
         "1) Выбери энергию\n"
-        "2) Напиши минимум 3 действия\n"
+        "2) Напиши минимум 3 действия (каждое с новой строки)\n"
         "3) Укажи тип и оценки\n"
         "4) Получишь главное действие\n"
-        "5) Я спрошу как идёт",
+        "5) Я спрошу как идёт 👍😵❌\n",
+        reply_markup=menu()
+    )
+
+def stats_flow(chat_id):
+    started_today = count_today(chat_id, "started")
+    focus_today = count_today(chat_id, "focus")
+    progress_today = count_today(chat_id, "progress")
+    bot.send_message(
+        chat_id,
+        f"📊 Статистика за сегодня:\n"
+        f"• Выборов (focus): <b>{focus_today}</b>\n"
+        f"• Начал: <b>{started_today}</b>\n"
+        f"• Ответов 'как идёт': <b>{progress_today}</b>",
         reply_markup=menu()
     )
 
@@ -168,71 +274,86 @@ def help_cmd(m):
 # =========================
 @bot.callback_query_handler(func=lambda c: c.data.startswith("energy:"))
 def energy_pick(c):
-    s = sessions.get(c.message.chat.id)
-    if not s or s["energy"]:
+    chat_id = c.message.chat.id
+    s = sessions.get(chat_id)
+    if not s or s.get("energy"):
+        bot.answer_callback_query(c.id, "Уже выбрано ✅")
         return
 
-    s["energy"] = c.data.split(":")[1]
-    log(c.message.chat.id, "energy", s["energy"])
+    code = c.data.split(":", 1)[1]  # high/mid/low
+    s["energy"] = code
+    log(chat_id, "energy", code)
 
-    bot.edit_message_text(
-        f"✅ Энергия выбрана: <b>{s['energy']}</b>",
-        c.message.chat.id,
-        c.message.message_id
-    )
+    try:
+        bot.edit_message_text(
+            f"✅ Энергия выбрана: <b>{energy_label(code)}</b>",
+            chat_id,
+            c.message.message_id
+        )
+    except Exception:
+        pass
 
     s["step"] = "actions"
-    bot.send_message(
-        c.message.chat.id,
-        "✍️ Напиши как минимум 3 действия (каждое с новой строки):"
-    )
+    bot.answer_callback_query(c.id)
+    bot.send_message(chat_id, "✍️ Напиши как минимум 3 действия (каждое с новой строки):", reply_markup=menu())
 
 # =========================
 # ACTIONS INPUT
 # =========================
-@bot.message_handler(func=lambda m: m.chat.id in sessions and sessions[m.chat.id]["step"] == "actions")
+@bot.message_handler(func=lambda m: m.chat.id in sessions and sessions[m.chat.id].get("step") == "actions")
 def actions_input(m):
-    lines = [l.strip() for l in m.text.split("\n") if l.strip()]
+    # ✅ если пользователь нажал кнопку меню — НЕ воспринимаем как список действий
+    if (m.text or "").strip() in MENU_TEXTS:
+        return menu_handler(m)
+
+    chat_id = m.chat.id
+    s = sessions[chat_id]
+
+    lines = [l.strip() for l in (m.text or "").split("\n") if l.strip()]
     if len(lines) < 3:
-        bot.send_message(m.chat.id, "❌ Нужно минимум 3 действия.")
+        bot.send_message(chat_id, "❌ Нужно минимум 3 действия (каждое с новой строки).", reply_markup=menu())
         return
 
-    s = sessions[m.chat.id]
     s["actions"] = [{"name": l, "type": None, "scores": []} for l in lines]
+    s["cur"] = 0
+    s["crit"] = 0
     s["step"] = "type"
-    ask_type(m.chat.id)
+    log(chat_id, "actions_count", str(len(lines)))
+    ask_type(chat_id)
 
 def ask_type(chat_id):
     s = sessions[chat_id]
     a = s["actions"][s["cur"]]
-    bot.send_message(
-        chat_id,
-        f"Тип действия:\n<b>{a['name']}</b>",
-        reply_markup=type_kb()
-    )
+    bot.send_message(chat_id, f"Тип действия:\n<b>{a['name']}</b>", reply_markup=type_kb())
 
 # =========================
 # TYPE
 # =========================
 @bot.callback_query_handler(func=lambda c: c.data.startswith("type:"))
 def type_pick(c):
-    s = sessions.get(c.message.chat.id)
-    if not s or s["step"] != "type":
+    chat_id = c.message.chat.id
+    s = sessions.get(chat_id)
+    if not s or s.get("step") != "type":
+        bot.answer_callback_query(c.id, "Сейчас не время выбирать тип 🙂")
         return
 
     a = s["actions"][s["cur"]]
-    a["type"] = c.data.split(":")[1]
-    log(c.message.chat.id, "type", a["type"])
+    a["type"] = c.data.split(":", 1)[1]
+    log(chat_id, "type", a["type"])
 
-    bot.edit_message_text(
-        f"✅ {a['name']} — {a['type']}",
-        c.message.chat.id,
-        c.message.message_id
-    )
+    try:
+        bot.edit_message_text(
+            f"✅ <b>{a['name']}</b> — {type_label(a['type'])}",
+            chat_id,
+            c.message.message_id
+        )
+    except Exception:
+        pass
 
     s["crit"] = 0
     s["step"] = "score"
-    ask_score(c.message.chat.id)
+    bot.answer_callback_query(c.id)
+    ask_score(chat_id)
 
 # =========================
 # SCORE
@@ -242,48 +363,60 @@ def ask_score(chat_id):
     a = s["actions"][s["cur"]]
     bot.send_message(
         chat_id,
-        f"{a['name']}\nОцени: <b>{CRITERIA[s['crit']]}</b>",
+        f"<b>{a['name']}</b>\nОцени: <b>{CRITERIA[s['crit']]}</b> (1–5)",
         reply_markup=score_kb()
     )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("score:"))
 def score_pick(c):
-    s = sessions.get(c.message.chat.id)
-    if not s or s["step"] != "score":
+    chat_id = c.message.chat.id
+    s = sessions.get(chat_id)
+    if not s or s.get("step") != "score":
+        bot.answer_callback_query(c.id, "Сейчас не время ставить оценку 🙂")
         return
 
-    score = int(c.data.split(":")[1])
+    score = int(c.data.split(":", 1)[1])
     s["actions"][s["cur"]]["scores"].append(score)
+    log(chat_id, "score", f"{CRITERIA[s['crit']]}={score}")
 
-    bot.edit_message_text(
-        f"✅ {CRITERIA[s['crit']]}: {score}",
-        c.message.chat.id,
-        c.message.message_id
-    )
+    try:
+        bot.edit_message_text(
+            f"✅ {CRITERIA[s['crit']]}: <b>{score}</b>",
+            chat_id,
+            c.message.message_id
+        )
+    except Exception:
+        pass
 
     s["crit"] += 1
+    bot.answer_callback_query(c.id)
+
     if s["crit"] >= 4:
         s["cur"] += 1
         if s["cur"] >= len(s["actions"]):
-            show_result(c.message.chat.id)
+            show_result(chat_id)
             return
         s["step"] = "type"
-        ask_type(c.message.chat.id)
+        ask_type(chat_id)
     else:
-        ask_score(c.message.chat.id)
+        ask_score(chat_id)
 
 # =========================
 # RESULT
 # =========================
 def show_result(chat_id):
     s = sessions[chat_id]
+    s["step"] = "result"
+
     best = pick_best(s["actions"], s["energy"])
     s["focus"] = best["name"]
     log(chat_id, "focus", s["focus"])
 
     bot.send_message(
         chat_id,
-        f"🔥 <b>Главное действие сейчас:</b>\n\n<b>{best['name']}</b>\n\n"
+        f"🔥 <b>Главное действие сейчас:</b>\n\n"
+        f"<b>{best['name']}</b>\n"
+        f"Тип: <b>{type_label(best.get('type'))}</b>\n\n"
         "Сделай первый шаг за 2–5 минут.",
         reply_markup=result_kb()
     )
@@ -295,50 +428,87 @@ def show_result(chat_id):
 def result_action(c):
     chat_id = c.message.chat.id
     s = sessions.get(chat_id)
-    if not s:
+    if not s or not s.get("focus"):
+        bot.answer_callback_query(c.id, "Сначала сделай выбор через 🚀 Начать")
         return
 
-    if c.data == "res:start":
-        log(chat_id, "started", s["focus"])
-        bot.edit_message_text(
-            f"🚀 Ты начал: <b>{s['focus']}</b>\n\nЧерез 5 минут спрошу, как идёт.",
-            chat_id,
-            c.message.message_id
-        )
+    focus = s["focus"]
+    cmd = c.data.split(":", 1)[1]
+
+    if cmd == "start":
+        log(chat_id, "started", focus)
+        cancel_timer(chat_id, "progress")
+
+        try:
+            bot.edit_message_text(
+                f"🚀 Ты начал: <b>{focus}</b>\n\nЧерез 5 минут спрошу, как идёт.",
+                chat_id,
+                c.message.message_id
+            )
+        except Exception:
+            pass
 
         def ask_progress():
-            bot.send_message(chat_id, "Как идёт?", reply_markup=progress_kb())
+            try:
+                bot.send_message(chat_id, "Как идёт?", reply_markup=progress_kb())
+            except Exception:
+                pass
 
-        timers[chat_id] = threading.Timer(300, ask_progress)
-        timers[chat_id].start()
+        t = threading.Timer(5 * 60, ask_progress)
+        timers.setdefault(chat_id, {})["progress"] = t
+        t.start()
 
-    elif c.data == "res:delay":
-        log(chat_id, "delayed", s["focus"])
-        bot.edit_message_text(
-            f"⏸ Отложено на 10 минут: <b>{s['focus']}</b>",
-            chat_id,
-            c.message.message_id
-        )
+        bot.answer_callback_query(c.id, "Погнали 🔥")
+        return
+
+    if cmd == "delay":
+        log(chat_id, "delayed_10m", focus)
+        cancel_timer(chat_id, "remind")
+
+        try:
+            bot.edit_message_text(
+                f"⏸ Отложено на 10 минут: <b>{focus}</b>\nЯ напомню.",
+                chat_id,
+                c.message.message_id
+            )
+        except Exception:
+            pass
+
+        def remind():
+            try:
+                bot.send_message(chat_id, f"⏰ Напоминание: <b>{focus}</b>", reply_markup=menu())
+                log(chat_id, "reminder_sent", focus)
+            except Exception:
+                pass
+
+        t = threading.Timer(10 * 60, remind)
+        timers.setdefault(chat_id, {})["remind"] = t
+        t.start()
+
+        bot.answer_callback_query(c.id, "Ок ⏸")
+        return
 
 # =========================
 # PROGRESS
 # =========================
 @bot.callback_query_handler(func=lambda c: c.data.startswith("prog:"))
 def progress(c):
-    val = c.data.split(":")[1]
-    log(c.message.chat.id, "progress", val)
+    chat_id = c.message.chat.id
+    val = c.data.split(":", 1)[1]
+    log(chat_id, "progress", val)
 
     texts = {
-        "ok": "👍 Отлично. Продолжай!",
-        "hard": "😵 Упрости задачу и сделай 2 минуты.",
-        "quit": "❌ Ничего страшного. Это тоже опыт."
+        "ok": "👍 Отлично. Продолжай ещё 10 минут или доведи до мини-результата.",
+        "hard": "😵 Упрости задачу в 2 раза и сделай 2 минуты. Главное — движение.",
+        "quit": "❌ Ничего страшного. Это тоже опыт. Можешь нажать 🚀 Начать и выбрать шаг поменьше."
     }
 
-    bot.edit_message_text(
-        texts[val],
-        c.message.chat.id,
-        c.message.message_id
-    )
+    try:
+        bot.edit_message_text(texts.get(val, "Ок"), chat_id, c.message.message_id)
+    except Exception:
+        pass
+
+    bot.answer_callback_query(c.id)
 
 # =========================
 # RUN
