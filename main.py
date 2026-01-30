@@ -216,7 +216,7 @@ def start_flow(chat_id):
     cancel_all(chat_id)
     new_session(chat_id)
     bot.send_message(chat_id, "Твоя энергия сейчас?", reply_markup=energy_kb())
-    bot.send_message(chat_id, "Меню:", reply_markup=menu())
+    bot.send_message(chat_id, "", reply_markup=menu())
     log(chat_id, "start_flow", "ok")
 
 def help_flow(chat_id):
@@ -566,4 +566,5 @@ if __name__ == "__main__":
     init_db()
     print("Bot started")
     bot.infinity_polling(skip_pending=True)
+
 
