@@ -156,7 +156,20 @@ def progress_kb():
 # =========================
 # HELPERS
 # =========================
-CRITERIA = ["Влияние", "Срочность", "Затраты сил", "Смысл"]
+CRITERIA = [
+    ("influence", "Влияние (польза для результата)"),
+    ("urgency",   "Срочность (насколько важно сейчас)"),
+    ("energy",    "Затраты сил (насколько тяжело сделать)"),
+    ("meaning",   "Смысл (важно лично тебе)"),
+]
+
+HINTS = {
+    "influence": "1 = почти не поможет, 5 = сильно продвинет",
+    "urgency":   "1 = можно позже, 5 = нужно сейчас/сегодня",
+    "energy":    "1 = легко, 5 = очень тяжело по силам",
+    "meaning":   "1 = не важно, 5 = очень важно для тебя",
+}
+
 
 def pick_best(actions, energy_code):
     # energy_code: low/mid/high
@@ -517,4 +530,5 @@ if __name__ == "__main__":
     init_db()
     print("Bot started")
     bot.infinity_polling(skip_pending=True)
+
 
