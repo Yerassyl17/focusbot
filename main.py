@@ -79,7 +79,7 @@ def new_session(chat_id):
     sessions[chat_id] = {
         "step": "energy",     # energy -> actions -> type -> score -> result
         "energy": None,       # 'high'/'mid'/'low'
-        "actions": [],
+        "actions": [],        # [{"name":..., "type":..., "scores":[...] }]
         "cur": 0,
         "crit": 0,
         "focus": None
@@ -97,16 +97,17 @@ def menu():
     return kb
 
 def energy_kb():
+    # ВАЖНО: callback_data = high/mid/low (а не "Высокая")
     kb = types.InlineKeyboardMarkup()
     kb.row(
-        types.InlineKeyboardButton("🔋 Высокая", callback_data="energy:Высокая"),
-        types.InlineKeyboardButton("😐 Средняя", callback_data="energy:Средняя"),
-        types.InlineKeyboardButton("🪫 Низкая", callback_data="energy:Низкая"),
+        types.InlineKeyboardButton("🔋 Высокая", callback_data="energy:high"),
+        types.InlineKeyboardButton("😐 Средняя", callback_data="energy:mid"),
+        types.InlineKeyboardButton("🪫 Низкая", callback_data="energy:low"),
     )
     return kb
 
 def energy_label(code: str) -> str:
-    return {"high":"🔋 Высокая", "mid":"😐 Средняя", "low":"🪫 Низкая"}.get(code, code)
+    return {"high": "🔋 Высокая", "mid": "😐 Средняя", "low": "🪫 Низкая"}.get(code, code)
 
 def type_kb():
     kb = types.InlineKeyboardMarkup()
@@ -170,7 +171,6 @@ HINTS = {
     "meaning":   "1 = не важно, 5 = очень важно для тебя",
 }
 
-
 def pick_best(actions, energy_code):
     # energy_code: low/mid/high
     weight = {"low": 2.0, "mid": 1.0, "high": 0.6}.get(energy_code, 1.0)
@@ -193,9 +193,9 @@ def pick_best(actions, energy_code):
     return best
 
 # =========================
-# MENU HANDLER (ВАЖНО: ДОЛЖЕН БЫТЬ ВЫШЕ step-хэндлеров)
+# MENU HANDLER (ДОЛЖЕН БЫТЬ ВЫШЕ step-хэндлеров)
 # =========================
-@bot.message_handler(func=lambda m: (m.text or "") in MENU_TEXTS)
+@bot.message_handler(func=lambda m: (m.text or "").strip() in MENU_TEXTS)
 def menu_handler(m):
     txt = (m.text or "").strip()
     chat_id = m.chat.id
@@ -226,7 +226,7 @@ def menu_handler(m):
 
         def remind():
             try:
-                bot.send_message(chat_id, f"⏰ Напоминание: <b>{focus}</b>\nНажми 🚀 Начать или продолжай это действие.", reply_markup=menu())
+                bot.send_message(chat_id, f"⏰ Напоминание: <b>{focus}</b>", reply_markup=menu())
                 log(chat_id, "reminder_sent", focus)
             except Exception:
                 pass
@@ -253,6 +253,7 @@ def stats_cmd(m):
 def start_flow(chat_id):
     cancel_all(chat_id)
     new_session(chat_id)
+
     bot.send_message(chat_id, "Твоя энергия сейчас?", reply_markup=energy_kb())
     bot.send_message(chat_id, "Меню:", reply_markup=menu())
     log(chat_id, "start_flow", "ok")
@@ -262,7 +263,7 @@ def help_flow(chat_id):
         chat_id,
         "Я помогаю выбрать одно главное действие.\n\n"
         "1) Выбери энергию\n"
-        "2) Напиши минимум 3 действия (каждое с новой строки)\n"
+        "2) Напиши как минимум 3 действия (каждое с новой строки)\n"
         "3) Укажи тип и оценки\n"
         "4) Получишь главное действие\n"
         "5) Я спрошу как идёт 👍😵❌\n",
@@ -289,7 +290,12 @@ def stats_flow(chat_id):
 def energy_pick(c):
     chat_id = c.message.chat.id
     s = sessions.get(chat_id)
-    if not s or s.get("energy"):
+
+    if not s:
+        bot.answer_callback_query(c.id, "Нажми 🚀 Начать")
+        return
+
+    if s.get("energy"):
         bot.answer_callback_query(c.id, "Уже выбрано ✅")
         return
 
@@ -315,16 +321,16 @@ def energy_pick(c):
 # =========================
 @bot.message_handler(func=lambda m: m.chat.id in sessions and sessions[m.chat.id].get("step") == "actions")
 def actions_input(m):
-    # ✅ если пользователь нажал кнопку меню — НЕ воспринимаем как список действий
+    # если пришло меню — игнорируем как "действия"
     if (m.text or "").strip() in MENU_TEXTS:
-        return menu_handler(m)
+        return
 
     chat_id = m.chat.id
     s = sessions[chat_id]
 
     lines = [l.strip() for l in (m.text or "").split("\n") if l.strip()]
     if len(lines) < 3:
-        bot.send_message(chat_id, "❌ Нужно минимум 3 действия (каждое с новой строки).", reply_markup=menu())
+        bot.send_message(chat_id, "❌ Нужно как минимум 3 действия (каждое с новой строки).", reply_markup=menu())
         return
 
     s["actions"] = [{"name": l, "type": None, "scores": []} for l in lines]
@@ -374,9 +380,16 @@ def type_pick(c):
 def ask_score(chat_id):
     s = sessions[chat_id]
     a = s["actions"][s["cur"]]
+
+    key, title = CRITERIA[s["crit"]]
+    hint = HINTS.get(key, "")
+
     bot.send_message(
         chat_id,
-        f"<b>{a['name']}</b>\nОцени: <b>{CRITERIA[s['crit']]}</b> (1–5)",
+        f"Действие: <b>{a['name']}</b>\n"
+        f"Тип: <b>{type_label(a.get('type'))}</b>\n\n"
+        f"Оцени: <b>{title}</b> (1–5)\n"
+        f"<i>{hint}</i>",
         reply_markup=score_kb()
     )
 
@@ -390,11 +403,13 @@ def score_pick(c):
 
     score = int(c.data.split(":", 1)[1])
     s["actions"][s["cur"]]["scores"].append(score)
-    log(chat_id, "score", f"{CRITERIA[s['crit']]}={score}")
+
+    key, title = CRITERIA[s["crit"]]
+    log(chat_id, "score", f"{key}={score}")
 
     try:
         bot.edit_message_text(
-            f"✅ {CRITERIA[s['crit']]}: <b>{score}</b>",
+            f"✅ {title}: <b>{score}</b>",
             chat_id,
             c.message.message_id
         )
@@ -530,5 +545,3 @@ if __name__ == "__main__":
     init_db()
     print("Bot started")
     bot.infinity_polling(skip_pending=True)
-
-
