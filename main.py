@@ -16,6 +16,9 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 KZ_TZ = timezone(timedelta(hours=5))
 
+ADMIN_IDS = {8311003582}   # твой chat_id
+MAX_DAILY_USES = 1         # для обычных пользователей
+
 # =========================
 # DATABASE
 # =========================
@@ -55,6 +58,12 @@ def count_today(chat_id, event):
             WHERE chat_id=? AND event=? AND substr(created_at,1,10)=?
         """, (chat_id, event, today))
         return int(cur.fetchone()[0])
+
+def can_use_bot(chat_id):
+    if chat_id in ADMIN_IDS:
+        return True
+    today_uses = count_today(chat_id, "focus")  # считаем реальные использования
+    return today_uses < MAX_DAILY_USES
 
 # =========================
 # SESSION MEMORY
@@ -97,7 +106,6 @@ def menu():
     return kb
 
 def energy_kb():
-    # ВАЖНО: callback_data = high/mid/low (а не "Высокая")
     kb = types.InlineKeyboardMarkup()
     kb.row(
         types.InlineKeyboardButton("🔋 Высокая", callback_data="energy:high"),
@@ -172,7 +180,6 @@ HINTS = {
 }
 
 def pick_best(actions, energy_code):
-    # energy_code: low/mid/high
     weight = {"low": 2.0, "mid": 1.0, "high": 0.6}.get(energy_code, 1.0)
 
     best = None
@@ -193,7 +200,52 @@ def pick_best(actions, energy_code):
     return best
 
 # =========================
-# MENU HANDLER (ДОЛЖЕН БЫТЬ ВЫШЕ step-хэндлеров)
+# FLOWS
+# =========================
+def start_flow(chat_id):
+    if not can_use_bot(chat_id):
+        bot.send_message(
+            chat_id,
+            "⛔ Лимит на сегодня исчерпан.\n\n"
+            f"Можно использовать бота <b>{MAX_DAILY_USES} раза в день</b>.\n"
+            "Попробуй завтра 🙌",
+            reply_markup=menu()
+        )
+        return
+
+    cancel_all(chat_id)
+    new_session(chat_id)
+    bot.send_message(chat_id, "Твоя энергия сейчас?", reply_markup=energy_kb())
+    bot.send_message(chat_id, "Меню:", reply_markup=menu())
+    log(chat_id, "start_flow", "ok")
+
+def help_flow(chat_id):
+    bot.send_message(
+        chat_id,
+        "Я помогаю выбрать одно главное действие.\n\n"
+        "1) Выбери энергию\n"
+        "2) Напиши как минимум 3 действия (каждое с новой строки)\n"
+        "3) Укажи тип и оценки\n"
+        "4) Получишь главное действие\n"
+        "5) Я спрошу как идёт 👍😵❌",
+        reply_markup=menu()
+    )
+
+def stats_flow(chat_id):
+    started_today = count_today(chat_id, "started")
+    focus_today = count_today(chat_id, "focus")
+    progress_today = count_today(chat_id, "progress")
+    bot.send_message(
+        chat_id,
+        "📊 Статистика за сегодня:\n"
+        f"• Выборов (focus): <b>{focus_today}</b>\n"
+        f"• Начал: <b>{started_today}</b>\n"
+        f"• Ответов 'как идёт': <b>{progress_today}</b>",
+        reply_markup=menu()
+    )
+
+# =========================
+# MENU HANDLER (ВАЖНО: ВЫШЕ step-хэндлеров)
 # =========================
 @bot.message_handler(func=lambda m: (m.text or "").strip() in MENU_TEXTS)
 def menu_handler(m):
@@ -234,6 +286,7 @@ def menu_handler(m):
         t = threading.Timer(10 * 60, remind)
         timers.setdefault(chat_id, {})["remind"] = t
         t.start()
+        return
 
 # =========================
 # COMMANDS
@@ -249,39 +302,6 @@ def help_cmd(m):
 @bot.message_handler(commands=["stats"])
 def stats_cmd(m):
     stats_flow(m.chat.id)
-
-def start_flow(chat_id):
-    cancel_all(chat_id)
-    new_session(chat_id)
-
-    bot.send_message(chat_id, "Твоя энергия сейчас?", reply_markup=energy_kb())
-    bot.send_message(chat_id, "Меню:", reply_markup=menu())
-    log(chat_id, "start_flow", "ok")
-
-def help_flow(chat_id):
-    bot.send_message(
-        chat_id,
-        "Я помогаю выбрать одно главное действие.\n\n"
-        "1) Выбери энергию\n"
-        "2) Напиши как минимум 3 действия (каждое с новой строки)\n"
-        "3) Укажи тип и оценки\n"
-        "4) Получишь главное действие\n"
-        "5) Я спрошу как идёт 👍😵❌\n",
-        reply_markup=menu()
-    )
-
-def stats_flow(chat_id):
-    started_today = count_today(chat_id, "started")
-    focus_today = count_today(chat_id, "focus")
-    progress_today = count_today(chat_id, "progress")
-    bot.send_message(
-        chat_id,
-        f"📊 Статистика за сегодня:\n"
-        f"• Выборов (focus): <b>{focus_today}</b>\n"
-        f"• Начал: <b>{started_today}</b>\n"
-        f"• Ответов 'как идёт': <b>{progress_today}</b>",
-        reply_markup=menu()
-    )
 
 # =========================
 # ENERGY
@@ -321,7 +341,7 @@ def energy_pick(c):
 # =========================
 @bot.message_handler(func=lambda m: m.chat.id in sessions and sessions[m.chat.id].get("step") == "actions")
 def actions_input(m):
-    # если пришло меню — игнорируем как "действия"
+    # меню уже обработается menu_handler, поэтому просто выходим
     if (m.text or "").strip() in MENU_TEXTS:
         return
 
@@ -384,6 +404,7 @@ def ask_score(chat_id):
     key, title = CRITERIA[s["crit"]]
     hint = HINTS.get(key, "")
 
+    # ✅ убрали "(1–5)" как ты хотел
     bot.send_message(
         chat_id,
         f"Действие: <b>{a['name']}</b>\n"
@@ -442,7 +463,7 @@ def show_result(chat_id):
 
     bot.send_message(
         chat_id,
-        f"🔥 <b>Главное действие сейчас:</b>\n\n"
+        "🔥 <b>Главное действие сейчас:</b>\n\n"
         f"<b>{best['name']}</b>\n"
         f"Тип: <b>{type_label(best.get('type'))}</b>\n\n"
         "Сделай первый шаг за 2–5 минут.",
@@ -545,4 +566,3 @@ if __name__ == "__main__":
     init_db()
     print("Bot started")
     bot.infinity_polling(skip_pending=True)
-
