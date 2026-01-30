@@ -388,7 +388,7 @@ def ask_score(chat_id):
         chat_id,
         f"Действие: <b>{a['name']}</b>\n"
         f"Тип: <b>{type_label(a.get('type'))}</b>\n\n"
-        f"Оцени: <b>{title}</b> (1–5)\n"
+        f"Оцени: <b>{title}</b>\n"
         f"<i>{hint}</i>",
         reply_markup=score_kb()
     )
@@ -545,3 +545,4 @@ if __name__ == "__main__":
     init_db()
     print("Bot started")
     bot.infinity_polling(skip_pending=True)
+
