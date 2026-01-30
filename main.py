@@ -99,9 +99,9 @@ def menu():
 def energy_kb():
     kb = types.InlineKeyboardMarkup()
     kb.row(
-        types.InlineKeyboardButton("🔋 Высокая", callback_data="energy:high"),
-        types.InlineKeyboardButton("😐 Средняя", callback_data="energy:mid"),
-        types.InlineKeyboardButton("🪫 Низкая", callback_data="energy:low"),
+        types.InlineKeyboardButton("🔋 Высокая", callback_data="energy:Высокая"),
+        types.InlineKeyboardButton("😐 Средняя", callback_data="energy:Средняя"),
+        types.InlineKeyboardButton("🪫 Низкая", callback_data="energy:Низкая"),
     )
     return kb
 
@@ -517,3 +517,4 @@ if __name__ == "__main__":
     init_db()
     print("Bot started")
     bot.infinity_polling(skip_pending=True)
+
