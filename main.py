@@ -1,6 +1,8 @@
 import os
 import threading
 import sqlite3
+import time
+from telebot.apihelper import ApiTelegramException
 from datetime import datetime, timedelta, timezone
 
 import telebot
@@ -205,5 +207,16 @@ def progress_handler(c):
 if __name__ == "__main__":
     init_db()
     print("Bot started")
-    bot.infinity_polling(skip_pending=True)
 
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, none_stop=True, timeout=60, long_polling_timeout=60)
+        except ApiTelegramException as e:
+            if "409" in str(e):
+                print("409 conflict: another instance is running. Retrying in 10s...")
+                time.sleep(10)
+            else:
+                raise
+        except Exception as e:
+            print("Polling error:", e)
+            time.sleep(5)
